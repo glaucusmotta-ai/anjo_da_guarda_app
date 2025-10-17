@@ -1,6 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Anjo da Guarda</string>
+
+    <!-- Canal de notificação -->
+    <string name="channel_id_sos">sos_audio_channel_id</string>
+    <string name="channel_name">Vigilância de voz</string>
+    <string name="channel_desc">Monitora a palavra-chave para SOS</string>
+
+    <!-- Notificação -->
     <string name="notif_title">Anjo da Guarda</string>
     <string name="notif_text">Vigilância de voz ativa</string>
 </resources>
