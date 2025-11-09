@@ -120,6 +120,12 @@ def _maps_url(lat: float, lon: float) -> str:
     lat_s, lon_s = _coords_str(lat, lon)
     return f"https://maps.google.com/?q={lat_s},{lon_s}"
 
+# Gera exatamente "?q=LAT,LON" para o campo local_aproximado do template
+def _local_aproximado_fragment(lat: float, lon: float) -> str:
+    lat_s, lon_s = _coords_str(float(lat), float(lon))
+    return f"?q={lat_s},{lon_s}"
+
+
 # ---------------------------------------------------------
 # DB helpers (SQLite)
 # ---------------------------------------------------------
@@ -421,13 +427,17 @@ def send_wa_template_zenvia_once(_from: str, to: str, template_id: str, fields: 
         raise RuntimeError("WA_NO_TEMPLATE_ID")
 
     url = "https://api.zenvia.com/v2/channels/whatsapp/messages"
+
+    # sanitiza campos (evita None e garante string)
+    f = {k: ("" if v is None else str(v)) for k, v in (fields or {}).items()}
+
     payload = {
         "from": _from,
-        "to": to,
+        "to": _msisdn_clean(to),
         "contents": [{
             "type": "template",
             "templateId": template_id,
-            "fields": fields or {}
+            "fields": f
         }]
     }
     cb = (os.getenv("ZENVIA_WA_CALLBACK_URL") or os.getenv("ZENVIA_CALLBACK_URL") or "").strip()
@@ -435,6 +445,10 @@ def send_wa_template_zenvia_once(_from: str, to: str, template_id: str, fields: 
         payload["callbackUrl"] = cb
 
     headers, proxies = _wa_headers_and_proxy()
+
+    # IMPORTANTE: logar depois de montar o payload
+    logger.warning("[WA DEBUG PAYLOAD] %s", json.dumps(payload, ensure_ascii=False))
+
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=20, proxies=proxies)
         ok = 200 <= resp.status_code < 300
@@ -452,6 +466,7 @@ def send_wa_to_numbers(numbers: List[str], text: str, tpl_fields: Optional[Dict[
         return [{"ok": False, "reason": "WA_FROM_MISSING"}]
     template_id = (os.getenv("ZENVIA_WA_TEMPLATE_ID") or "").strip()
     use_simple = os.getenv("ZENVIA_WA_SIMPLE", "false").lower() in ("1","true","yes","on")
+    logger.warning("[WA CHOICE] use_simple=%s template_id=%s tpl_fields=%s", use_simple, template_id, json.dumps(tpl_fields, ensure_ascii=False))
     results = []
     for raw in numbers:
         to = _msisdn_clean(raw)
@@ -867,6 +882,19 @@ def auth_consent(token: str = Form(...), agree: Optional[str] = Form(None), requ
 
     return RedirectResponse(url=f"/onboarding/profile?token={token}", status_code=302)
 
+@app.get("/debug/zenvia_conf")
+def debug_zenvia_conf():
+    to_list = [x.strip() for x in (os.getenv("ZENVIA_WA_TO_LIST") or "").split(",") if x.strip()]
+    return {
+        "wa_from": os.getenv("ZENVIA_WA_FROM", ""),
+        "wa_to_list": to_list,
+        "template_id": os.getenv("ZENVIA_WA_TEMPLATE_ID", ""),
+        "simple": os.getenv("ZENVIA_WA_SIMPLE", "false"),
+        "callback": os.getenv("ZENVIA_CALLBACK_URL", ""),
+        "token_set": bool(os.getenv("ZENVIA_API_TOKEN", "").strip()),
+    }
+
+
 # ---------------------------------------------------------
 # Perfil
 # ---------------------------------------------------------
@@ -1263,7 +1291,7 @@ async def api_sos(payload: SosIn):
                 if fields_mode == "maps":
                     # template com variáveis {{nome}} e {{maps_link}}
                     if maps_link:
-                        tpl_fields["maps_link"] = maps_link
+                        tpl_fields["local_aproximado"] = _local_aproximado_fragment(float(lat), float(lon))
                 else:
                     # template com variáveis {{nome}}, {{lat}} e {{lon}}
                     if lat is not None:
@@ -1366,10 +1394,8 @@ async def api_sos(payload: SosIn):
                     tpl_fields = None
                 else:
                     tpl_fields = {}
-                    if _valid_coords(lat, lon):
-                        lat_s, lon_s = _coords_str(float(lat), float(lon))
-                        tpl_fields["lat"] = lat_s
-                        tpl_fields["lon"] = lon_s
+                    if _valid_coords(lat, lon) and maps_link:
+                        tpl_fields["local_aproximado"] = _local_aproximado_fragment(float(lat), float(lon))
                     if nome_tpl:
                         tpl_fields["nome"] = nome_tpl
                     wa_text = ""
@@ -1377,15 +1403,17 @@ async def api_sos(payload: SosIn):
                 logger.info("[WA] sending... from=%s to_list=%s mode=%s",
                             from_wa, to_wa_raw,
                             "template" if (not use_simple_wa and template_id) else "text")
+                wa_fallback_text = ("🚨 SOS – ANJO DA GUARDA" + (f"\n{maps_link}" if maps_link else "")).strip()
+
 
                 if not use_simple_wa and template_id:
                     try:
                         wa_results = send_wa_zenvia_list_template(tpl_fields)
                     except Exception as e_tpl:
                         logger.warning("[WA] template falhou (%s); usando texto", e_tpl)
-                        wa_results = send_wa_zenvia_list(wa_text)
+                        wa_results = send_wa_zenvia_list(wa_fallback_text)
                 else:
-                    wa_results = send_wa_zenvia_list(wa_text)
+                    wa_results = send_wa_zenvia_list(wa_fallback_text)
 
                 sent_whatsapp = 1 if any(r.get("ok") for r in wa_results) else 0
                 logger.info("[WA] results=%s", wa_results)
@@ -1567,3 +1595,4 @@ WEB_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "web"))
 if not os.path.isdir(WEB_DIR):
     os.makedirs(WEB_DIR, exist_ok=True)
 app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")
+
