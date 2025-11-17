@@ -1,13 +1,19 @@
+// lib/audio_service_controller.dart
 import 'package:flutter/services.dart';
 
-const _channel = MethodChannel('sos_audio_channel');
+const MethodChannel _ch = MethodChannel('anjo/native_sos');
 
 Future<bool> startService() async {
-  final ok = await _channel.invokeMethod('startService');
-  return (ok == true);
+  final ok = await _ch.invokeMethod<bool>('startService');
+  return ok == true;
 }
 
 Future<bool> stopService() async {
-  final ok = await _channel.invokeMethod('stopService');
-  return (ok == true);
+  final ok = await _ch.invokeMethod<bool>('stopService');
+  return ok == true;
+}
+
+Future<bool> isServiceRunning() async {
+  final ok = await _ch.invokeMethod<bool>('isServiceRunning');
+  return ok == true;
 }

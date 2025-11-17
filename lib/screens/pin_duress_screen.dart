@@ -3,8 +3,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../services/native_sos.dart';
+import '../audio_service_controller.dart'; // isServiceRunning()
 
 class PinDuressScreen extends StatefulWidget {
   const PinDuressScreen({super.key});
@@ -78,24 +80,31 @@ class _PinDuressScreenState extends State<PinDuressScreen> {
   }
 
   Future<void> _handlePin(String pin) async {
-    // Reentrância
     if (_isProcessing) return;
     _isProcessing = true;
 
-    // Validação forte: exatamente 4 dígitos
+    // Exatamente 4 dígitos
     final is4digits = RegExp(r'^\d{4}$').hasMatch(pin);
     if (!is4digits) {
       _isProcessing = false;
       return;
     }
 
-    // Stealth: fecha teclado (só depois de validar)
+    // Stealth: fecha teclado
     FocusScope.of(context).unfocus();
 
     // ===== COAÇÃO =====
     if (pin == _pinDuress) {
-      // Debounce 5s
-      final now = DateTime.now();
+      // Só dispara se o serviço de áudio estiver ATIVO
+      final active = await isServiceRunning();
+      if (!active) {
+        _ctrl.clear();
+        _isProcessing = false;
+        return;
+      }
+
+      // debounce 5s entre disparos
+      final now = DateTime.now(); // <-- adicionado
       if (_lastDuress != null && now.difference(_lastDuress!) < const Duration(seconds: 5)) {
         _isProcessing = false;
         return;
@@ -104,13 +113,22 @@ class _PinDuressScreenState extends State<PinDuressScreen> {
 
       final (lat, lon, acc) = await _tryGetLatLon();
       final accTxt = (acc != null) ? " (±${acc.round()} m)" : "";
-      await NativeSos.send("🚨 SOS – COAÇÃO$accTxt", lat: lat, lon: lon);
+      await NativeSos.send(
+        "🚨 ALERTA de Contato\nSituação: sos pessoal\nSe não puder ajudar, encaminhe às autoridades.",
+        lat: lat,
+        lon: lon,
+      );
 
-      if (!mounted) return;
-      // Limpa campo e vai para tela neutra
+
       _ctrl.clear();
       _isProcessing = false;
 
+      await Future.delayed(const Duration(milliseconds: 600));
+      if (!mounted) return;
+      // Fecha/minimiza a atividade para modo stealth
+      SystemNavigator.pop();
+
+      // Opcional: fallback para tela preta se a atividade não fechar
       Future.delayed(const Duration(seconds: 1), () {
         if (mounted) {
           Navigator.of(context).pushReplacement(
@@ -144,10 +162,77 @@ class _PinDuressScreenState extends State<PinDuressScreen> {
     await _handlePin(v);
   }
 
+  // ===== Menu da “catraca” =====
+  Future<void> _requestCorePerms() async {
+    final statuses = await [
+      Permission.notification,
+      Permission.microphone,
+      Permission.location,
+    ].request();
+
+    final notifOk = statuses[Permission.notification]?.isGranted ?? true;
+    final micOk   = statuses[Permission.microphone]?.isGranted ?? false;
+    final locOk   = statuses[Permission.location]?.isGranted ?? false;
+
+    if (!mounted) return;
+    final msg = 'Notificações: ${notifOk ? "OK" : "NÃO"} | '
+                'Microfone: ${micOk ? "OK" : "NÃO"} | '
+                'Localização: ${locOk ? "OK" : "NÃO"}';
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  void _openHomeDebug() {
+    Navigator.of(context).pushReplacementNamed('/home');
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
+
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+        elevation: 0,
+        systemOverlayStyle: SystemUiOverlayStyle.light,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'Menu',
+            onPressed: () {
+              showModalBottomSheet(
+                context: context,
+                showDragHandle: true,
+                builder: (c) => SafeArea(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      ListTile(
+                        leading: const Icon(Icons.lock_reset),
+                        title: const Text('Solicitar permissões do app'),
+                        subtitle: const Text('Notificações, Microfone e Localização'),
+                        onTap: () async { Navigator.pop(c); await _requestCorePerms(); },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.home_outlined),
+                        title: const Text('Abrir Home (debug)'),
+                        onTap: () { Navigator.pop(c); _openHomeDebug(); },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.settings),
+                        title: const Text('Configurações'),
+                        onTap: () { Navigator.pop(c); Navigator.of(context).pushNamed('/settings'); },
+                      ),
+                      const SizedBox(height: 8),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ],
+      ),
+
       body: SafeArea(
         child: Center(
           child: SizedBox(
@@ -159,7 +244,8 @@ class _PinDuressScreenState extends State<PinDuressScreen> {
                 const SizedBox(height: 16),
                 Text(_hint, style: const TextStyle(color: Colors.white70)),
                 const SizedBox(height: 8),
-                TextField(
+                TextField
+                (
                   controller: _ctrl,
                   autofocus: true,
                   obscureText: true,
@@ -178,7 +264,7 @@ class _PinDuressScreenState extends State<PinDuressScreen> {
                     border: InputBorder.none,
                   ),
                   onChanged: _onChanged,
-                  onSubmitted: _handlePin,
+                  onSubmitted: (v) => _handlePin(v),
                 ),
               ],
             ),

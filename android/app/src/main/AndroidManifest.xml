@@ -26,7 +26,8 @@
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode">
-            <meta-data android:name="io.flutter.embedding.android.NormalTheme"
+            <meta-data
+                android:name="io.flutter.embedding.android.NormalTheme"
                 android:resource="@style/NormalTheme"/>
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
@@ -38,7 +39,19 @@
             android:name=".AudioService"
             android:exported="true"
             android:stopWithTask="false"
-            android:foregroundServiceType="microphone|location"/>
+            android:foregroundServiceType="microphone|location" />
+
+        <!-- Quick Settings Tile (apenas UMA declaração) -->
+        <service
+            android:name=".SosQuickTileService"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="SOS Anjo da Guarda"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
 
         <meta-data android:name="flutterEmbedding" android:value="2"/>
     </application>

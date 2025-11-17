@@ -18,23 +18,27 @@ android {
         versionCode = flutter.versionCode
         versionName = flutter.versionName
 
-        // ===== BuildConfig disponíveis no código (escopo global) =====
-        // Zenvia - token (já existia no seu arquivo)
-        buildConfigField(
-            "String",
-            "ZENVIA_TOKEN",
-            "\"FiFdXfsHjfE9Yk-MH2glzc1uyXB_IKqTaYYC\""
-        )
+        // Campos padrão (vazios) para TODAS as builds
+        buildConfigField("String", "TELEGRAM_BOT_TOKEN", "\"\"")
+        buildConfigField("String", "TELEGRAM_CHAT_ID", "\"\"")
+
+        buildConfigField("String", "ZENVIA_TOKEN", "\"\"")
+        buildConfigField("String", "ZENVIA_SMS_FROM", "\"\"")
+        buildConfigField("String", "ZENVIA_WA_FROM", "\"\"")
+
+        buildConfigField("String", "SENDGRID_API_KEY", "\"\"")
+        buildConfigField("String", "SENDGRID_FROM", "\"\"")
     }
 
     // Necessário para expor BuildConfig.*
     buildFeatures { buildConfig = true }
 
+    // Use Java 17 (recomendado pelas versões atuais do Flutter/AGP)
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "11" }
+    kotlinOptions { jvmTarget = "17" }
 
     // Assinatura: usa o debug para testes
     signingConfigs {
@@ -45,59 +49,48 @@ android {
         // Segredos para testes locais (debug)
         debug {
             // --- TELEGRAM ---
+            // BOT TOKEN fica no BuildConfig; o destino (chat_id/@canal) vem da UI
             buildConfigField(
                 "String",
                 "TELEGRAM_BOT_TOKEN",
-                "\"8218538803:AAF4f01L5YpdnhqmYMKHtZPWIwZomK58yJ4\""
-            )
-            buildConfigField(
-                "String",
-                "TELEGRAM_CHAT_ID",
-                "\"548741187\""
+                "\"\""
             )
 
-            // --- ZENVIA (preencha com seus dados reais) ---
+            // --- ZENVIA (SMS/WhatsApp) ---
+            // Token e remetentes (FROM) são nossos e não aparecem na UI
+            buildConfigField(
+                "String",
+                "ZENVIA_TOKEN",
+                "\"FiFdXfsHjfE9Yk-MH2glzc1uyXB_IKqTaYYC\""
+            )
             buildConfigField(
                 "String",
                 "ZENVIA_SMS_FROM",
-                "\"SEU_REMETENTE_SMS\""        // ex: "5511961704582"
+                "\"glaucusmotta\""        // o MESMO from que você usa hoje no Zenvia
             )
             buildConfigField(
                 "String",
                 "ZENVIA_WA_FROM",
-                "\"SEU_REMETENTE_WHATSAPP\""   // ex: "5511961704582"
-            )
-            buildConfigField(
-                "String",
-                "SOS_SMS_TO",
-                "\"5511974152712\""
-            )
-            buildConfigField(
-                "String",
-                "SOS_WA_TO",
-                "\"5511974152712\""
+                "\"5511961704582\""   // o MESMO from que você usa hoje no Zenvia
             )
 
-            // --- SENDGRID (e-mail) ---
+            // --- SENDGRID (E-mail) ---
+            // Aqui vai a CHAVE da API do SendGrid (não é e-mail)
             buildConfigField(
                 "String",
                 "SENDGRID_API_KEY",
-                "\"SUA_SENDGRID_KEY\""
+                "\"\""   // coloque aqui a API key real do SendGrid quando tiver
             )
+            // E-mail remetente que você vai cadastrar/verificar no SendGrid
             buildConfigField(
                 "String",
                 "SENDGRID_FROM",
-                "\"seu-remetente@dominio.com\""
-            )
-            buildConfigField(
-                "String",
-                "SOS_EMAIL_TO",
-                "\"glaucusmotta@gmail.com,glaucusmotta@hotmail.com\""
+                "\"contato@3g-brasil.com\""
             )
         }
 
         release {
-            // Keystore de debug apenas para testes (não usar em produção)
+            // (para testes) assina com o debug; em produção use seu keystore
             signingConfig = signingConfigs.getByName("debug")
             isMinifyEnabled = false
             isShrinkResources = false

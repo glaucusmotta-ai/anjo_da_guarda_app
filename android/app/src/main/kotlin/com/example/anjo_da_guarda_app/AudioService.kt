@@ -24,13 +24,9 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import java.text.Normalizer
 import android.util.Log
-
-
 import androidx.core.content.ContextCompat
 import android.content.pm.PackageManager
-
 import com.google.android.gms.location.LocationServices
-
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -39,15 +35,29 @@ import org.json.JSONObject
 
 class AudioService : Service(), RecognitionListener {
 
-    private val NOTIF_ID = 1001
-    private val CHANNEL_ID = "sos_audio_channel_id"
-    private val CHANNEL_NAME = "Vigilância de voz"
-    private val CHANNEL_DESC = "Notificações do serviço de escuta SOS"
+    companion object {
+        private const val NOTIF_ID   = 1001
+        private const val CHANNEL_ID = "sos_audio_channel_id"
+        private const val CHANNEL_NAME = "Serviço em 1º plano"
+        private const val CHANNEL_DESC = "Monitoramento de palavra-chave para SOS"
+
+        // ação explícita para parar o serviço (usaremos no próximo passo pelo Dart)
+        const val ACTION_STOP = "com.example.anjo_da_guarda_app.ACTION_STOP"
+
+        @JvmStatic var isRunning: Boolean = false
+    }
 
     private lateinit var nm: NotificationManager
     private var recognizer: SpeechRecognizer? = null
     private lateinit var recIntent: Intent
     private val handler = Handler(Looper.getMainLooper())
+
+    private fun fullyReleaseRecognizer() {
+    try { recognizer?.cancel() } catch (_: Throwable) {}
+    try { recognizer?.setRecognitionListener(null) } catch (_: Throwable) {}
+    try { recognizer?.destroy() } catch (_: Throwable) {}
+    recognizer = null
+    }
 
     // Telegram
     private val http by lazy { OkHttpClient() }
@@ -63,6 +73,7 @@ class AudioService : Service(), RecognitionListener {
 
     override fun onCreate() {
         super.onCreate()
+        isRunning = true
         ensureSosChannel()
         nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         startForeground(NOTIF_ID, baseNotification())
@@ -71,44 +82,67 @@ class AudioService : Service(), RecognitionListener {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == "ACTION_STOP_SOS") {
+            Log.d(TAG, "Recebido ACTION_STOP_SOS — encerrando serviço")
+            // Para qualquer re-listen pendente
+            handler.removeCallbacksAndMessages(null)
+            // Para o reconhecimento de voz
+            try { recognizer?.stopListening() } catch (_: Throwable) {}
+            try { recognizer?.cancel() } catch (_: Throwable) {}
+            // Atualiza flag e encerra foreground
+            isRunning = false
+            stopForeground(true)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        // Fluxo normal: garantir recognizer e começar a escutar
         if (recognizer == null) setupRecognizer()
         startListening()
+        isRunning = true
         return START_STICKY
     }
+
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        stopListening()
-        recognizer?.destroy()
-        recognizer = null
-        super.onDestroy()
+    isRunning = false
+    // para qualquer re-agendamento de startListening
+    handler.removeCallbacksAndMessages(null)
+    // solta o microfone de forma agressiva
+    fullyReleaseRecognizer()
+    // remove notificação e o estado de foreground
+    try { stopForeground(true) } catch (_: Throwable) {}
+    try { (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(NOTIF_ID) } catch (_: Throwable) {}
+    super.onDestroy()
     }
 
     // ---------- Notificações ----------
     private fun baseNotification(): Notification {
+        // texto neutro, sem nome do app
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("Vigiando comando de voz")
-            .setContentText("Diga: oi ... (1–3s) ... socorro")
+            .setSmallIcon(android.R.drawable.ic_lock_silent_mode) // discreto
+            .setContentTitle("Serviço ativo")
+            .setContentText("Monitorando palavra-chave")
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW) // silencioso
             .build()
     }
 
     private fun triggerAlert() {
-        // 🚨 + **SOS ANJO DA GUARDA**
-        val title = SpannableString("🚨 SOS ANJO DA GUARDA").apply {
+        val title = SpannableString("🚨 SOS").apply {
             setSpan(StyleSpan(Typeface.BOLD), 2, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
         val notif = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
             .setContentTitle(title)
             .setContentText("Alerta confirmado")
-            .setStyle(NotificationCompat.BigTextStyle().bigText("🚨 SOS ANJO DA GUARDA"))
+            .setStyle(NotificationCompat.BigTextStyle().bigText("🚨 SOS"))
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setOnlyAlertOnce(false)
             .build()
         nm.notify(NOTIF_ID, notif)
 
@@ -119,17 +153,14 @@ class AudioService : Service(), RecognitionListener {
     private fun ensureSosChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.getNotificationChannel(CHANNEL_ID)?.let { nm.deleteNotificationChannel(CHANNEL_ID) }
-        val ch = NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_HIGH).apply {
+        val ch = NotificationChannel(
+            CHANNEL_ID,
+            CHANNEL_NAME,
+            NotificationManager.IMPORTANCE_LOW // baixo: sem som
+        ).apply {
             description = CHANNEL_DESC
-            enableVibration(true)
-            setSound(
-                Settings.System.DEFAULT_NOTIFICATION_URI,
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_NOTIFICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build()
-            )
+            setSound(null, null) // força silencioso
+            enableVibration(false)
         }
         nm.createNotificationChannel(ch)
     }
@@ -178,40 +209,40 @@ class AudioService : Service(), RecognitionListener {
     override fun onEvent(eventType: Int, params: Bundle?) {}
 
     private fun handleBundle(bundle: Bundle) {
-    val list = bundle.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: return
-    val heardRaw = list.firstOrNull() ?: return
-    val heard = normalize(heardRaw)
-    Log.d(TAG, "heardRaw=$heardRaw -> $heard")
+        val list = bundle.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: return
+        val heardRaw = list.firstOrNull() ?: return
+        val heard = normalize(heardRaw)
+        Log.d(TAG, "heardRaw=$heardRaw -> $heard")
 
-    val now = SystemClock.elapsedRealtime()
+        val now = SystemClock.elapsedRealtime()
 
-    // TESTE: dispare só com uma palavra
-    if (heard.contains("socorro")) {
-        Log.d(TAG, "Trigger by single word")
-        resetWakeSequence()
-        triggerAlert()
-        return
-    }
-
-    // Sequência: "oi" -> "socorro" com 1..3s entre
-    if (tokenIndex == 0 && heard.contains(TOKENS[0])) {
-        tokenIndex = 1
-        lastTokenTs = now
-    } else if (tokenIndex == 1 && heard.contains(TOKENS[1])) {
-        val gap = now - lastTokenTs
-        if (gap in MIN_GAP_MS..MAX_GAP_MS) {
-            tokenIndex = 0
+        // TESTE: dispare só com uma palavra
+        if (heard.contains("socorro")) {
+            Log.d(TAG, "Trigger by single word")
+            resetWakeSequence()
             triggerAlert()
-        } else {
+            return
+        }
+
+        // Sequência: "oi" -> "socorro" com 1..3s entre
+        if (tokenIndex == 0 && heard.contains(TOKENS[0])) {
+            tokenIndex = 1
+            lastTokenTs = now
+        } else if (tokenIndex == 1 && heard.contains(TOKENS[1])) {
+            val gap = now - lastTokenTs
+            if (gap in MIN_GAP_MS..MAX_GAP_MS) {
+                tokenIndex = 0
+                triggerAlert()
+            } else {
+                resetWakeSequence()
+            }
+        }
+
+        // timeout entre palavras
+        if (tokenIndex > 0 && (now - lastTokenTs) > MAX_GAP_MS) {
             resetWakeSequence()
         }
     }
-
-    // timeout entre palavras
-    if (tokenIndex > 0 && (now - lastTokenTs) > MAX_GAP_MS) {
-        resetWakeSequence()
-    }
-}
 
     private fun resetWakeSequence() {
         tokenIndex = 0
@@ -233,17 +264,16 @@ class AudioService : Service(), RecognitionListener {
         if (token.isBlank() || chatId.isBlank() || chatId == "<SUBSTITUA_PELO_SEU_CHAT_ID>") return
 
         val url = "https://api.telegram.org/bot${token}/sendMessage"
-        val payload = JSONObject()
-            .put("chat_id", chatId)
-            .put("text", html)
-            .put("parse_mode", "HTML")
-            .toString()
-            .toRequestBody(jsonMedia)
+        val payload = JSONObject().apply {
+            put("chat_id", chatId)
+            put("text", html)
+            put("parse_mode", "HTML")
+        }.toString().toRequestBody(jsonMedia)
 
         Thread {
             try {
                 val req = Request.Builder().url(url).post(payload).build()
-                http.newCall(req).execute().use { /* opcional: checar it.isSuccessful */ }
+                http.newCall(req).execute().use { }
             } catch (_: Throwable) { }
         }.start()
     }
@@ -254,12 +284,11 @@ class AudioService : Service(), RecognitionListener {
         if (token.isBlank() || chatId.isBlank() || chatId == "<SUBSTITUA_PELO_SEU_CHAT_ID>") return
 
         val url = "https://api.telegram.org/bot${token}/sendLocation"
-        val payload = JSONObject()
-            .put("chat_id", chatId)
-            .put("latitude", lat)
-            .put("longitude", lng)
-            .toString()
-            .toRequestBody(jsonMedia)
+        val payload = JSONObject().apply {
+            put("chat_id", chatId)
+            put("latitude", lat)
+            put("longitude", lng)
+        }.toString().toRequestBody(jsonMedia)
 
         Thread {
             try {
@@ -270,7 +299,7 @@ class AudioService : Service(), RecognitionListener {
     }
 
     private fun sendTelegramAlertWithOptionalLocation() {
-        val base = "🚨 <b>SOS ANJO DA GUARDA</b>"
+        val base = "🚨 <b>SOS</b>"
         if (!hasLocationPermission()) {
             sendTelegramMessage("$base\n(Localização sem permissão)")
             return
@@ -282,7 +311,7 @@ class AudioService : Service(), RecognitionListener {
                     val link = "https://maps.google.com/?q=${loc.latitude},${loc.longitude}"
                     val txt = "$base\n📍 <a href=\"$link\">Abrir localização</a>"
                     sendTelegramMessage(txt)
-                    sendTelegramLocation(loc.latitude, loc.longitude) // opcional
+                    sendTelegramLocation(loc.latitude, loc.longitude)
                 } else {
                     sendTelegramMessage("$base\n(Localização indisponível)")
                 }

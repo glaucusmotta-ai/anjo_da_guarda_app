@@ -36,6 +36,26 @@ import html as _html
 from string import Template
 import logging
 
+import android.content.Intent
+import android.service.quicksettings.TileService
+import android.util.Log
+
+
+# ---------------------------------------------------------
+# Tile Service - SOS Quick
+# ---------------------------------------------------------
+class SosQuickTileService : TileService() {
+    override fun onClick() {
+        super.onClick()
+        Log.i("SosQuickTile", "Tile pressionado")
+
+        // Dispara um broadcast; no próximo passo vamos criar o Receiver
+        val i = Intent("com.example.anjo_da_guarda_app.ACTION_SOS_TILE")
+        i.setPackage(packageName)
+        applicationContext.sendBroadcast(i)
+    }
+}
+
 # ---------------------------------------------------------
 # Logs + .env (carregar .env da raiz ANTES de ler variáveis)
 # ---------------------------------------------------------
@@ -96,6 +116,7 @@ def _force_ipv4():
     except Exception:
         pass
 _force_ipv4()
+
 
 # ---------------------------------------------------------
 # Helpers diversos
@@ -478,42 +499,86 @@ def send_wa_to_numbers(numbers: List[str], text: str, tpl_fields: Optional[Dict[
     return results
 
 # ---------------------------------------------------------
-# E-mail
+# E-mail (Zoho-friendly, TLS1.2+, STARTTLS/SSL auto)
 # ---------------------------------------------------------
+from email.message import EmailMessage
+from email.utils import formataddr, formatdate
+import smtplib, ssl
+from typing import Optional, List, Dict, Any
+
 def send_email(subject: str, body: str, to_list: Optional[List[str]] = None) -> Dict[str, Any]:
     if not CFG.email_enabled:
         return {"ok": False, "reason": "EMAIL_DISABLED"}
 
-    to_list = to_list or ([x.strip() for x in CFG.email_to_legacy.split(",") if x.strip()])
+    to_list = to_list or ([x.strip() for x in (CFG.email_to_legacy or "").split(",") if x.strip()])
     if not to_list:
         return {"ok": False, "reason": "EMAIL_NO_RECIPIENTS"}
 
+    # Monta mensagem
     msg = EmailMessage()
     from_name = (os.getenv("EMAIL_FROM_NAME") or "").strip()
-    msg["From"] = formataddr((from_name, CFG.email_from)) if from_name else CFG.email_from
+    from_addr = CFG.email_from
+    msg["From"] = formataddr((from_name, from_addr)) if from_name else from_addr
     msg["To"] = ", ".join(to_list)
     msg["Subject"] = subject
-    msg.set_content(body)
+    msg["Date"] = formatdate(localtime=True)
+    # Opcional: reply-to se existir no .env
+    reply_to = (os.getenv("EMAIL_REPLY_TO") or "").strip()
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    # Boa prática p/ Zoho: remetente autenticado
+    msg["Sender"] = CFG.smtp_user
 
+    # UTF-8 garante acentos/emoji no corpo
+    msg.set_content(body, charset="utf-8")
+
+    # TLS 1.2+
     ctx = ssl.create_default_context()
     try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # Python 3.7+
+    except Exception:
+        pass
+
+    def _via_starttls():
         with smtplib.SMTP(CFG.smtp_host, CFG.smtp_port, timeout=25) as s:
-            s.ehlo(); s.starttls(context=ctx); s.ehlo()
+            s.ehlo()
+            s.starttls(context=ctx)
+            s.ehlo()
             s.login(CFG.smtp_user, CFG.smtp_pass)
             s.send_message(msg)
-        logger.info("[EMAIL] OK via STARTTLS to=%s", to_list)
-        return {"ok": True}
-    except Exception as e1:
-        logger.warning("[EMAIL] STARTTLS falhou (%s); tentando SSL:465 ...", e1)
-        try:
-            with smtplib.SMTP_SSL(CFG.smtp_host, 465, context=ctx, timeout=25) as s:
-                s.login(CFG.smtp_user, CFG.smtp_pass)
-                s.send_message(msg)
+
+    def _via_ssl465():
+        with smtplib.SMTP_SSL(CFG.smtp_host, 465, context=ctx, timeout=25) as s:
+            s.login(CFG.smtp_user, CFG.smtp_pass)
+            s.send_message(msg)
+
+    tried = []
+    try:
+        if int(CFG.smtp_port) == 465:
+            _via_ssl465()
             logger.info("[EMAIL] OK via SSL465 to=%s", to_list)
-            return {"ok": True, "fallback": "SSL465"}
-        except Exception as e2:
-            logger.error("[EMAIL] FALHA DEFINITIVA: %s", e2)
-            return {"ok": False, "reason": f"{type(e2).__name__}: {e2}"}
+            return {"ok": True, "mode": "SSL465"}
+        else:
+            _via_starttls()
+            logger.info("[EMAIL] OK via STARTTLS to=%s", to_list)
+            return {"ok": True, "mode": "STARTTLS"}
+    except Exception as e1:
+        tried.append(f"{type(e1).__name__}: {e1}")
+        if int(CFG.smtp_port) != 465:
+            logger.warning("[EMAIL] STARTTLS falhou (%s); fallback para SSL:465 ...", e1)
+            try:
+                _via_ssl465()
+                logger.info("[EMAIL] OK via SSL465 (fallback) to=%s", to_list)
+                return {"ok": True, "mode": "SSL465_FALLBACK"}
+            except Exception as e2:
+                tried.append(f"{type(e2).__name__}: {e2}")
+
+        logger.error(
+            "[EMAIL] FALHA DEFINITIVA host=%s port=%s user=%s from=%s err=%s",
+            CFG.smtp_host, CFG.smtp_port, CFG.smtp_user, from_addr, " | ".join(tried)
+        )
+        return {"ok": False, "reason": "EMAIL_SEND_FAILED", "errors": tried}
+
 
 # ---------------------------------------------------------
 # Zenvia (SMS) - legado/env
@@ -762,6 +827,7 @@ class SosIn(BaseModel):
     lon: Optional[float] = None
     acc: Optional[float] = None          # mantido para e-mail/Telegram; NÃO vai no template
     text: Optional[str] = None
+    nome: Optional[str] = None
     s1: Optional[str] = None             # pode carregar 'nome' se quiser
     s2: Optional[str] = None
     user_email: Optional[str] = None     # se vier, usa contatos do usuário
@@ -1345,29 +1411,65 @@ async def api_sos(payload: SosIn):
             token_ok = bool(os.getenv("ZENVIA_API_TOKEN"))
             to_raw = os.getenv("ZENVIA_SMS_TO_LIST", "")
             if token_ok and to_raw:
+                # helpers locais
+                _get = (lambda o, k, d="": (o.get(k, d) if isinstance(o, dict) else getattr(o, k, d)))
+                def _sanitize(s: str) -> str:
+                    # evita caracteres que já causaram rejeição em alguns provedores
+                    return (s or "") \
+                        .replace("–", "-").replace("—", "-") \
+                        .replace("…", "...") \
+                        .replace("’", "'") \
+                        .replace("“", '"').replace("”", '"')
+
+                nome = (_get(payload, "nome", "") or os.getenv("ZENVIA_WA_NOME") or "").strip()
+                text_line = _get(payload, "text", "").strip()
+
+                # garante inclusão do link quando houver coordenadas válidas
+                has_coords = _valid_coords(lat, lon) and bool(maps_link)
+
                 use_simple = os.getenv("ZENVIA_SMS_SIMPLE", "false").lower() in ("1", "true", "yes", "on")
                 if use_simple:
-                    sms_text = f"SOS - {maps_link or ''}".strip()
+                    # simples: tenta sempre incluir o link; se não houver coords, usa o texto
+                    sms_text = f"SOS - {(maps_link if has_coords else (text_line or 'SOS pessoal'))}".strip()
                 else:
-                    sms_text = f"🚨 SOS – ANJO DA GUARDA\n{(payload.text or '').strip()}\n{maps_link or ''}".strip()
+                    # Montagem padrão (sem acentos “exóticos” e com fallback quando não há coords)
+                    titulo = f"ALERTA de {nome}" if nome else "ALERTA"
+                    linhas = [
+                        titulo,
+                        f"Situacao: {text_line or 'SOS pessoal'}",
+                        (f"Localizacao (mapa): {maps_link}" if has_coords else "Localizacao: nao informada"),
+                    ]
+                    sms_text = "\n".join(linhas).strip()
 
+                sms_text = _sanitize(sms_text)
+                logger.info("[SMS] body=%s", sms_text)
+
+                # >>> a chamada de envio permanece a mesma, logo abaixo deste bloco <<<
+
+
+                # Override por .env (agora aceita {nome})
                 override = (os.getenv("ZENVIA_SMS_TEST") or "").strip()
                 if override:
                     try:
                         sms_text = override.format(
                             maps_link=maps_link or "",
                             MAPS_LINK=maps_link or "",
-                            text=(payload.text or "").strip(),
-                            TEXT=(payload.text or "").strip(),
+                            text=text_line,
+                            TEXT=text_line,
+                            nome=nome,
+                            NOME=nome,
                         )
                     except Exception as e:
                         logger.warning("[SMS] override.format falhou: %s; usando fallback literal", e)
                         sms_text = (override
                                     .replace("{maps_link}", maps_link or "")
                                     .replace("{MAPS_LINK}", maps_link or "")
-                                    .replace("{text}", (payload.text or "").strip())
-                                    .replace("{TEXT}", (payload.text or "").strip()))
-                sms_text = sms_text.replace("\\n", "\n").replace("\\r\\n", "\n")[:700]
+                                    .replace("{text}", text_line)
+                                    .replace("{TEXT}", text_line)
+                                    .replace("{nome}", nome)
+                                    .replace("{NOME}", nome))
+
+                sms_text = _sanitize(sms_text.replace("\\n", "\n").replace("\\r\\n", "\n"))[:700]
 
                 logger.info("[SMS] sending... from=%s to_list=%s", _resolve_sms_sender(), to_raw)
                 sms_results = send_sms_zenvia_list(sms_text)
@@ -1377,6 +1479,7 @@ async def api_sos(payload: SosIn):
                 logger.info("[SMS] skipped: token_ok=%s to_list_present=%s", token_ok, bool(to_raw))
         except Exception as e:
             logger.error("[SMS] erro ao enviar: %s", e)
+
 
         # WhatsApp (Zenvia) – legado via .env
         try:
