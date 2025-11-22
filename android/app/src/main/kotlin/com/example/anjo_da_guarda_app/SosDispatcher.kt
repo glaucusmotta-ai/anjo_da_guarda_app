@@ -26,7 +26,6 @@ class SosDispatcher(private val ctx: Context) {
     private fun normalizeMsisdn(raw: String): String =
         raw.filter { it.isDigit() }
 
-
     // ---------- Helpers ----------
     private fun mapsLink(lat: Double?, lon: Double?): String? {
         if (lat == null || lon == null) return null
@@ -45,16 +44,43 @@ class SosDispatcher(private val ctx: Context) {
         return t
     }
 
+    // Lê o "nome completo" salvo pelo Flutter nas SharedPreferences
+    // (arquivo padrão do plugin: "FlutterSharedPreferences", chaves começam com "flutter.")
+    private fun getNomeCompletoFromPrefs(): String? {
+        return try {
+            val prefs = ctx.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            val possibleKeys = listOf(
+                "flutter.nomeCompleto",
+                "flutter.nome_completo",
+                "flutter.userFullName",
+                "flutter.user_name"
+            )
+            for (key in possibleKeys) {
+                val v = prefs.getString(key, null)?.trim()
+                if (!v.isNullOrEmpty()) {
+                    Log.d("ANJO_SOS", "nomeCompleto encontrado em $key = $v")
+                    return v
+                }
+            }
+            null
+        } catch (t: Throwable) {
+            Log.e("ANJO_SOS", "erro ao ler nome completo das prefs", t)
+            null
+        }
+    }
+
     private fun logResp(tag: String, resp: Response) {
         val code = resp.code
         val body = try { resp.body?.string() ?: "" } catch (_: Throwable) { "<no-body>" }
         Log.d(tag, "HTTP $code :: $body")
     }
-   
+
     /**
      * Envia para os canais usando segredos do BuildConfig e destinatários vindos da UI:
      *  - tgTarget: chat_id numérico ou @canal/@grupo/@username (precisa conversa iniciada p/ PF)
      *  - smsTo/waTo/emailTo: listas de destinatários (podem estar vazias)
+     *
+     * OBS: WhatsApp SEMPRE via TEMPLATE Zenvia/Meta (nada de texto livre).
      */
     fun sendAll(
         text: String,
@@ -73,7 +99,7 @@ class SosDispatcher(private val ctx: Context) {
                     "lat=$lat lon=$lon"
         )
 
-        // TELEGRAM (ainda disponível, mas não é prioridade)
+        // TELEGRAM
         thread {
             runCatching { sendTelegram(fullText, tgTarget, lat, lon) }
                 .onFailure { Log.e("TG", "falha TG", it) }
@@ -150,7 +176,19 @@ class SosDispatcher(private val ctx: Context) {
         }
 
         val url = "https://api.zenvia.com/v2/channels/sms/messages"
-        val safeMsg = stripForSms(msg)
+
+        // Ajusta "ALERTA de Contato" -> "ALERTA de {Nome Completo}" usando o cadastro do usuário
+        val nomeCompleto = getNomeCompletoFromPrefs()
+        val adjustedMsg = if (!nomeCompleto.isNullOrBlank()) {
+            val pattern = Regex("ALERTA de\\s+Contato", RegexOption.IGNORE_CASE)
+            val replaced = pattern.replace(msg) { "ALERTA de $nomeCompleto" }
+            Log.d("ZENVIA_SMS", "msg ajustada com nomeCompleto='$nomeCompleto'")
+            replaced
+        } else {
+            msg
+        }
+
+        val safeMsg = stripForSms(adjustedMsg)
 
         list.filter { it.isNotBlank() }.forEach { to ->
             try {
@@ -183,7 +221,27 @@ class SosDispatcher(private val ctx: Context) {
         }
     }
 
-   //---------------- Zenvia WhatsApp (TEMPLATE aprovado) ----------------
+    // =============================================================
+    //  ZENVIA WHATSAPP – TEMPLATE APROVADO
+    //
+    //  ESTE BLOCO ESTÁ VALIDADO NOS TESTES EM 18/11/2025
+    //  Qualquer mudança errada aqui pode QUEBRAR o envio pela Meta/Zenvia.
+    //
+    //  NÃO ALTERAR (SEM COORDENAR COM O TEMPLATE):
+    //    • templateId
+    //    • nomes dos campos em "fields": "nome" e "link_rastreamento"
+    //    • estrutura do JSON:
+    //         {
+    //           "type": "template",
+    //           "templateId": "...",
+    //           "fields": {
+    //             "nome": "...",
+    //             "link_rastreamento": "..."
+    //           }
+    //         }
+    // =============================================================
+
+    //---------------- Zenvia WhatsApp (TEMPLATE aprovado) ----------------
     private fun sendZenviaWhats(
         msg: String,
         list: List<String>,
@@ -214,17 +272,16 @@ class SosDispatcher(private val ctx: Context) {
             return
         }
 
-        // Mesmo padrão do backend: "?q=lat,lon" em local_aproximado
-        val locParam = if (lat != null && lon != null) {
-            "?q=$lat,$lon"
-        } else {
-            "?q=0,0"
-        }
-        Log.d("ZENVIA_WA", "using local_aproximado=$locParam")
+        // Link de rastreamento para o campo {{link_rastreamento}}
+        val trackingLink = mapsLink(lat, lon)
+            ?: "https://maps.google.com/?q=0,0"
+        Log.d("ZENVIA_WA", "using link_rastreamento=$trackingLink")
 
-        // TEMPLATE já aprovado na Zenvia/Meta
-        val templateId = "30db2264-c09a-4ae5-afc6-e2aeb234bb0c"
-        val nome = extractNomeFromText(msg)
+        // TEMPLATE aprovado na Zenvia/Meta
+        val templateId = "406d05ec-cd3c-4bca-add3-ddd521aef484"
+
+        // Prioriza o "nome completo" do cadastro; se não tiver, cai no texto "ALERTA de ..."
+        val nome = getNomeCompletoFromPrefs() ?: extractNomeFromText(msg)
 
         val url = "https://api.zenvia.com/v2/channels/whatsapp/messages"
 
@@ -232,7 +289,7 @@ class SosDispatcher(private val ctx: Context) {
             try {
                 val fields = JSONObject()
                     .put("nome", nome)
-                    .put("local_aproximado", locParam)
+                    .put("link_rastreamento", trackingLink)
 
                 val contents = JSONArray().put(
                     JSONObject()
@@ -264,7 +321,9 @@ class SosDispatcher(private val ctx: Context) {
         }
     }
 
-    // Tira o nome a partir da primeira linha da mensagem "ALERTA de ..."
+    // Tira o nome a partir da primeira linha da mensagem "ALERTA de ...":
+    // "🚨 ALERTA de Fulano\nSituação: sos pessoal\n..."
+    // (usado como fallback, se não achar o nome nas SharedPreferences)
     private fun extractNomeFromText(msg: String): String {
         val marker = "ALERTA de "
         val idx = msg.indexOf(marker)
@@ -283,7 +342,6 @@ class SosDispatcher(private val ctx: Context) {
         }
         return "Contato"
     }
-
 
     // ---------------- E-mail (SendGrid) ----------------
     private fun sendEmailSendGrid(msg: String, list: List<String>) {
@@ -327,4 +385,3 @@ class SosDispatcher(private val ctx: Context) {
         http.newCall(req).execute().use { logResp("MAIL", it) }
     }
 }
-

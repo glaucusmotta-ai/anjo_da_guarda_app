@@ -20,7 +20,7 @@ android {
 
         // Campos padrão (vazios) para TODAS as builds
         buildConfigField("String", "TELEGRAM_BOT_TOKEN", "\"\"")
-        buildConfigField("String", "TELEGRAM_CHAT_ID", "\"\"")
+        buildConfigField("String", "TELEGRAM_CHAT_ID", "\"123456789,987654321\"")
 
         buildConfigField("String", "ZENVIA_TOKEN", "\"\"")
         buildConfigField("String", "ZENVIA_SMS_FROM", "\"\"")
@@ -53,7 +53,12 @@ android {
             buildConfigField(
                 "String",
                 "TELEGRAM_BOT_TOKEN",
-                "\"\""
+                "\"8218538803:AAF4f01L5YpdnhqmYMKHtZPWIwZomK58yJ4\""
+            )
+            buildConfigField(
+                "String",
+                "TELEGRAM_CHAT_ID",
+                "\"548741187\""
             )
 
             // --- ZENVIA (SMS/WhatsApp) ---
@@ -75,17 +80,18 @@ android {
             )
 
             // --- SENDGRID (E-mail) ---
-            // Aqui vai a CHAVE da API do SendGrid (não é e-mail)
+            // IMPORTANTE:
+            //  - SENDGRID_API_KEY: a CHAVE da API do SendGrid (Settings > API Keys)
+            //  - SENDGRID_FROM: e-mail remetente verificado no SendGrid
             buildConfigField(
                 "String",
                 "SENDGRID_API_KEY",
-                "\"\""   // coloque aqui a API key real do SendGrid quando tiver
+                "\"SUA_SENDGRID_API_KEY_AQUI\""
             )
-            // E-mail remetente que você vai cadastrar/verificar no SendGrid
             buildConfigField(
                 "String",
                 "SENDGRID_FROM",
-                "\"contato@3g-brasil.com\""
+                "\"alerta@3g-brasil.com\""
             )
         }
 

@@ -1,0 +1,29 @@
+﻿{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Start Backend (Uvicorn)",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        "-m", "uvicorn",
+        "anjo_web_main:app",
+        "--host", "127.0.0.1",
+        "--port", "8000",
+        "--reload"
+      ],
+      "options": { "cwd": "${workspaceFolder}/backend" },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Send SOS (Email test)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+        "$headers=@{Accept='application/json';'Content-Type'='application/json'}; $body=@{lat=-23.4861427;lon=-46.6910794;text='SOS – teste EMAIL (VSCode task)'} | ConvertTo-Json -Depth 5; Invoke-RestMethod -Method POST -Uri 'http://127.0.0.1:8000/api/sos' -Headers $headers -Body $body | ConvertTo-Json -Depth 10"
+      ],
+      "presentation": { "reveal": "always", "panel": "shared" }
+    }
+  ]
+}

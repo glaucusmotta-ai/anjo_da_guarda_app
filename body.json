@@ -1,0 +1,16 @@
+﻿{
+  "from": "5511961704582",
+  "to": "5511974152712",
+  "contents": [
+    {
+      "type": "template",
+      "templateId": "222caa4b-8f24-4145-afb2-4b75ee730133",
+      "fields": {
+        "nome": "Cacá",
+        "situacao": "sos pessoal",
+        "lat": "-23.4861427",
+        "lon": "-46.6910794"
+      }
+    }
+  ]
+}
