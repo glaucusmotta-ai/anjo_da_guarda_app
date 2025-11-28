@@ -2072,7 +2072,6 @@ async def api_sos(payload: SosIn):
         else None
     )
 
-
     user_id = None
     if payload.user_email:
         with db() as con:
@@ -2105,30 +2104,27 @@ async def api_sos(payload: SosIn):
                 in ("1", "true", "yes", "on")
             )
             template_id = (os.getenv("ZENVIA_WA_TEMPLATE_ID") or "").strip()
-            fields_mode = (
-                os.getenv("ZENVIA_WA_FIELDS_MODE", "latlon") or "latlon"
-            ).lower()
             nome_env = (os.getenv("ZENVIA_WA_NOME") or (payload.s1 or "")).strip()
+            nome_final = nome_tpl or nome_env or ""
 
             if use_simple_wa or not template_id:
+                # modo texto simples
                 wa_text = f"SOS - {maps_link or ''}".strip()
                 tpl_fields = None
             else:
+                # Template SOS_ALERTA:
+                # {{1}} -> nome
+                # {{2}} -> link do Google Maps
+                # {{3}} -> link do mapa rastreável
+                gm_link = maps_link
+                if not gm_link and _valid_coords(lat, lon):
+                    gm_link = _maps_url(float(lat), float(lon))
+                tpl_fields = {
+                    "1": nome_final,
+                    "2": gm_link or "",
+                    "3": tracking_url or "",
+                }
                 wa_text = ""
-                tpl_fields = {}
-                if nome_env:
-                    tpl_fields["nome"] = nome_env
-
-                if fields_mode == "maps":
-                    if maps_link and _valid_coords(lat, lon):
-                        tpl_fields["local_aproximado"] = _local_aproximado_fragment(
-                            float(lat), float(lon)
-                        )
-                else:
-                    if lat is not None:
-                        tpl_fields["lat"] = str(lat)
-                    if lon is not None:
-                        tpl_fields["lon"] = str(lon)
 
             wa_user_results = send_wa_to_numbers(wa_numbers, wa_text, tpl_fields)
             wa_results.extend(wa_user_results)
@@ -2225,6 +2221,7 @@ async def api_sos(payload: SosIn):
                         sms_text = override.format(
                             maps_link=maps_link or "",
                             MAPS_LINK=maps_link or "",
+                            text_line=text_line,
                             text=text_line,
                             TEXT=text_line,
                             nome=nome,
@@ -2283,20 +2280,27 @@ async def api_sos(payload: SosIn):
                 )
 
                 if use_simple_wa or not template_id:
+                    # modo texto simples (sem template)
                     wa_text = (
                         f"🚨 ALERTA de {(nome_tpl or 'contato')}\n"
                         f"Situação: {(payload.text or '').strip()}\n"
                         f"Localização (mapa): {maps_link or ''}"
+                        + (f"\nRastreamento: {tracking_url}" if tracking_url else "")
                     ).strip()
                     tpl_fields = None
                 else:
-                    tpl_fields = {}
-                    if _valid_coords(lat, lon) and maps_link:
-                        tpl_fields["local_aproximado"] = _local_aproximado_fragment(
-                            float(lat), float(lon)
-                        )
-                    if nome_tpl:
-                        tpl_fields["nome"] = nome_tpl
+                    # Template SOS_ALERTA:
+                    # {{1}} -> nome
+                    # {{2}} -> link do Google Maps
+                    # {{3}} -> link do mapa rastreável
+                    gm_link = maps_link
+                    if not gm_link and _valid_coords(lat, lon):
+                        gm_link = _maps_url(float(lat), float(lon))
+                    tpl_fields = {
+                        "1": (nome_tpl or ""),
+                        "2": gm_link or "",
+                        "3": tracking_url or "",
+                    }
                     wa_text = ""
 
                 logger.info(
@@ -2305,10 +2309,11 @@ async def api_sos(payload: SosIn):
                     to_wa_raw,
                     "template" if (not use_simple_wa and template_id) else "text",
                 )
-                wa_fallback_text = (
+                wa_fallback_text = wa_text or (
                     "🚨 ALERTA de "
                     + (nome_tpl or "contato")
                     + (f"\nLocalização (mapa): {maps_link}" if maps_link else "")
+                    + (f"\nRastreamento: {tracking_url}" if tracking_url else "")
                 ).strip()
 
                 if not use_simple_wa and template_id:
