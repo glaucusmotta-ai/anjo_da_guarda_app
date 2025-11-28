@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# from services.zenvia import format_local_aproximado
 
 import os
 import ssl
@@ -13,21 +12,10 @@ import json
 import time
 import re
 import socket
-import requests
-import urllib3.util.connection as urllib3_cn
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from typing import Optional, Dict, Any, List, Tuple
-from email.utils import formataddr
-
-from fastapi import FastAPI, Request, Form, BackgroundTasks
-from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from dotenv import load_dotenv
-
-# HTTP "manual"
+from email.utils import formataddr, formatdate
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import URLError, HTTPError
@@ -36,46 +24,38 @@ import html as _html
 from string import Template
 import logging
 
-import android.content.Intent
-import android.service.quicksettings.TileService
-import android.util.Log
+import requests
+import urllib3.util.connection as urllib3_cn
+from dotenv import load_dotenv
+
+from fastapi import FastAPI, Request, Form, BackgroundTasks
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 
 # ---------------------------------------------------------
-# Tile Service - SOS Quick
-# ---------------------------------------------------------
-class SosQuickTileService : TileService() {
-    override fun onClick() {
-        super.onClick()
-        Log.i("SosQuickTile", "Tile pressionado")
-
-        // Dispara um broadcast; no próximo passo vamos criar o Receiver
-        val i = Intent("com.example.anjo_da_guarda_app.ACTION_SOS_TILE")
-        i.setPackage(packageName)
-        applicationContext.sendBroadcast(i)
-    }
-}
-
-# ---------------------------------------------------------
-# Logs + .env (carregar .env da raiz ANTES de ler variáveis)
+# Logs + .env
 # ---------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("anjo_da_guarda.telegram")
+logger = logging.getLogger("anjo_da_guarda")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.normpath(os.path.join(BASE_DIR, "..", ".env"))
-load_dotenv(ENV_PATH, override=True)   # .env do projeto
-load_dotenv(override=True)             # fallback
+load_dotenv(ENV_PATH, override=True)
+logger.info("[ENV] usando .env em %s", ENV_PATH)
+# Removido o segundo load_dotenv geral pra não sobrescrever com outro .env perdido
+# load_dotenv(override=True)
 
-# ---------------------------------------------------------
-# Constantes / Config
-# ---------------------------------------------------------
 DATA_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "anjo.db")
 
+# ---------------------------------------------------------
+# Config
+# ---------------------------------------------------------
 class CFG:
-    # App
     app_title: str = "Anjo da Guarda (Web)"
     public_base_url: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
 
@@ -85,7 +65,6 @@ class CFG:
     smtp_port: int = int(os.getenv("EMAIL_SMTP_PORT", "587"))
     smtp_user: str = os.getenv("EMAIL_USERNAME", "")
     smtp_pass: str = os.getenv("EMAIL_PASSWORD", "")
-    # remetente real (fallback para EMAIL_USERNAME)
     email_from: str = os.getenv("EMAIL_FROM", "") or os.getenv("EMAIL_USERNAME", "")
     email_from_name: str = os.getenv("EMAIL_FROM_NAME", "")
     email_to_legacy: str = os.getenv("EMAIL_TO_LIST", "")
@@ -93,36 +72,42 @@ class CFG:
     # Telegram
     tg_enabled: bool = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
     tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    tg_bot_username: str = os.getenv("TELEGRAM_BOT_USERNAME", "")  # sem @
+    tg_bot_username: str = os.getenv("TELEGRAM_BOT_USERNAME", "")
     tg_chat_id_legacy: str = os.getenv("TELEGRAM_CHAT_ID", "")
     tg_chat_ids: str = os.getenv("TELEGRAM_CHAT_IDS", "")
     tg_broadcast_throttle_ms: int = int(os.getenv("TELEGRAM_THROTTLE_MS", "120"))
 
+
 # ---------------------------------------------------------
-# App + CORS
+# FastAPI + CORS
 # ---------------------------------------------------------
 app = FastAPI(title=CFG.app_title)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# -----------------------------------------------------------
-# Força IPv4 para evitar bloqueio do Cloudflare (IPv6 estava sendo barrado)
-# -----------------------------------------------------------
+# ---------------------------------------------------------
+# Forçar IPv4 para evitar bloqueio Cloudflare
+# ---------------------------------------------------------
 def _force_ipv4():
     try:
         urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
     except Exception:
         pass
+
+
 _force_ipv4()
 
-
 # ---------------------------------------------------------
-# Helpers diversos
+# Helpers gerais
 # ---------------------------------------------------------
 def _now() -> str:
     return datetime.utcnow().isoformat()
+
 
 def _valid_coords(lat: Optional[float], lon: Optional[float]) -> bool:
     try:
@@ -132,37 +117,396 @@ def _valid_coords(lat: Optional[float], lon: Optional[float]) -> bool:
     except Exception:
         return False
 
+
 def _coords_str(lat: float, lon: float) -> Tuple[str, str]:
-    # força ponto decimal e até 7 casas
     return (f"{float(lat):.7f}", f"{float(lon):.7f}")
 
+
 def _maps_url(lat: float, lon: float) -> str:
-    # padrão comprovado que funcionou
     lat_s, lon_s = _coords_str(lat, lon)
     return f"https://maps.google.com/?q={lat_s},{lon_s}"
 
-# Gera exatamente "?q=LAT,LON" para o campo local_aproximado do template
+
 def _local_aproximado_fragment(lat: float, lon: float) -> str:
-    lat_s, lon_s = _coords_str(float(lat), float(lon))
+    lat_s, lon_s = _coords_str(lat, lon)
     return f"?q={lat_s},{lon_s}"
 
+
+# ---------------------------------------------------------
+# Live tracking em memória (URL /t/<session_id>)
+# ---------------------------------------------------------
+TRACKING_BASE_URL = os.getenv("TRACKING_BASE_URL", "").strip()
+LIVE_TRACK_SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+logger.info(
+    "[BOOT] __file__=%s PUBLIC_BASE_URL=%s TRACKING_BASE_URL=%s",
+    __file__,
+    CFG.public_base_url,
+    TRACKING_BASE_URL,
+)
+
+
+def _create_live_tracking_session(
+    nome: Optional[str],
+    lat: Optional[float],
+    lon: Optional[float],
+) -> Optional[Tuple[str, str]]:
+    if not _valid_coords(lat, lon):
+        return None
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except Exception:
+        return None
+
+    now = _now()
+    session_id = secrets.token_urlsafe(10)
+    LIVE_TRACK_SESSIONS[session_id] = {
+        "nome": (nome or "").strip() or "contato",
+        "lat": lat_f,
+        "lon": lon_f,
+        "updated_at": now,
+        "track": [{"lat": lat_f, "lon": lon_f, "ts": now}],
+    }
+
+    if TRACKING_BASE_URL:
+        base = TRACKING_BASE_URL.rstrip("/")
+    else:
+        base = CFG.public_base_url.rstrip("/")
+
+    tracking_url = f"{base}/t/{session_id}"
+
+    logger.info(
+        "[TRACK] nova sessão id=%s base=%s PUBLIC_BASE_URL=%s TRACKING_BASE_URL=%s",
+        session_id,
+        base,
+        CFG.public_base_url,
+        TRACKING_BASE_URL,
+    )
+
+    return session_id, tracking_url
+
+
+@app.get("/api/live-track/state/{session_id}")
+def live_track_state(session_id: str):
+    data = LIVE_TRACK_SESSIONS.get(session_id)
+    if not data:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "reason": "SESSION_NOT_FOUND"},
+        )
+
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "lat": data.get("lat"),
+        "lon": data.get("lon"),
+        "nome": data.get("nome"),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+@app.post("/api/live-track/start")
+def live_track_start(payload: Dict[str, Any], request: Request):
+    nome = (payload.get("nome") or "").strip() or "nome"
+    lat = payload.get("lat")
+    lon = payload.get("lon")
+
+    if lat is None or lon is None:
+        return JSONResponse(
+            status_code=400, content={"ok": False, "reason": "LAT_LON_REQUIRED"}
+        )
+
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except Exception:
+        return JSONResponse(
+            status_code=400, content={"ok": False, "reason": "INVALID_COORDS"}
+        )
+
+    now = _now()
+    session_id = secrets.token_urlsafe(10)
+    LIVE_TRACK_SESSIONS[session_id] = {
+        "nome": nome,
+        "lat": lat_f,
+        "lon": lon_f,
+        "updated_at": now,
+        "track": [{"lat": lat_f, "lon": lon_f, "ts": now}],
+    }
+
+    if TRACKING_BASE_URL:
+        base = TRACKING_BASE_URL.rstrip("/")
+    else:
+        base = str(request.base_url).rstrip("/")
+
+    tracking_url = f"{base}/t/{session_id}"
+
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "tracking_url": tracking_url,
+    }
+
+
+@app.post("/api/live-track/update")
+def live_track_update(payload: Dict[str, Any]):
+    session_id = (payload.get("session_id") or payload.get("id") or "").strip()
+    if not session_id or session_id not in LIVE_TRACK_SESSIONS:
+        return JSONResponse(
+            status_code=404, content={"ok": False, "reason": "SESSION_NOT_FOUND"}
+        )
+
+    lat = payload.get("lat")
+    lon = payload.get("lon")
+    if lat is None or lon is None:
+        return JSONResponse(
+            status_code=400, content={"ok": False, "reason": "LAT_LON_REQUIRED"}
+        )
+
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except Exception:
+        return JSONResponse(
+            status_code=400, content={"ok": False, "reason": "INVALID_COORDS"}
+        )
+
+    session = LIVE_TRACK_SESSIONS[session_id]
+    session["lat"] = lat_f
+    session["lon"] = lon_f
+    session["updated_at"] = _now()
+
+    track = session.get("track")
+    if not isinstance(track, list):
+        track = []
+    track.append({"lat": lat_f, "lon": lon_f, "ts": _now()})
+    if len(track) > 500:
+        track.pop(0)
+    session["track"] = track
+
+    return {"ok": True}
+
+
+@app.get("/api/live-track/last/{session_id}")
+def live_track_last(session_id: str):
+    data = LIVE_TRACK_SESSIONS.get(session_id)
+    if not data:
+        return JSONResponse(
+            status_code=404, content={"ok": False, "reason": "SESSION_NOT_FOUND"}
+        )
+    out = {"ok": True, "session_id": session_id}
+    out.update(
+        {
+            "nome": data.get("nome"),
+            "lat": data.get("lat"),
+            "lon": data.get("lon"),
+            "updated_at": data.get("updated_at"),
+        }
+    )
+    return out
+
+
+@app.get("/api/live-track/track/{session_id}")
+def live_track_track(session_id: str):
+    data = LIVE_TRACK_SESSIONS.get(session_id)
+    if not data:
+        return JSONResponse(
+            status_code=404, content={"ok": False, "reason": "SESSION_NOT_FOUND"}
+        )
+
+    track = data.get("track") or []
+    safe_track = []
+    for p in track:
+        try:
+            lat = float(p.get("lat"))
+            lon = float(p.get("lon"))
+            safe_track.append({"lat": lat, "lon": lon, "ts": p.get("ts")})
+        except Exception:
+            continue
+
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "nome": data.get("nome"),
+        "track": safe_track,
+    }
+
+
+@app.get("/t/{session_id}")
+def live_track_page(session_id: str):
+    if session_id not in LIVE_TRACK_SESSIONS:
+        return HTMLResponse(
+            "<h3>Rastreamento não encontrado ou encerrado.</h3>", status_code=404
+        )
+
+    html = """
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+      <meta charset="utf-8">
+      <title>Rastreamento - Anjo da Guarda</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1"/>
+
+      <link
+        rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin=""
+      />
+
+      <style>
+        body {
+          margin: 0;
+          font-family: Arial, sans-serif;
+          background: #000;
+          color: #fff;
+        }
+        header {
+          padding: 10px 16px;
+          background: #111;
+          font-size: 14px;
+          line-height: 1.4;
+        }
+        #status {
+          font-size: 12px;
+          opacity: 0.85;
+        }
+        #hint {
+          font-size: 11px;
+          opacity: 0.7;
+          margin-top: 4px;
+        }
+        #map {
+          width: 100vw;
+          height: calc(100vh - 70px);
+        }
+      </style>
+    </head>
+    <body>
+      <header>
+        <div>🚨 Rastreamento em tempo (quase) real</div>
+        <div id="status">Carregando localização...</div>
+        <div id="hint">
+          A linha no mapa mostra o caminho percorrido pelo aparelho de quem pediu ajuda.
+        </div>
+      </header>
+      <div id="map"></div>
+
+      <script
+        src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+        crossorigin="">
+      </script>
+
+      <script>
+        const parts = window.location.pathname.split("/");
+        const sessionId = parts[parts.length - 1] || parts[parts.length - 2];
+        const statusEl = document.getElementById("status");
+
+        let map = null;
+        let marker = null;
+        let polyline = null;
+        let initialized = false;
+
+        function initMap(lat, lon) {
+          map = L.map("map").setView([lat, lon], 17);
+
+          L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            maxZoom: 19,
+            attribution: "&copy; OpenStreetMap contributors"
+          }).addTo(map);
+
+          marker = L.marker([lat, lon]).addTo(map);
+          polyline = L.polyline([[lat, lon]]).addTo(map);
+        }
+
+        function updateRoute(track, nome) {
+          if (!Array.isArray(track) || track.length === 0) {
+            statusEl.textContent = "Aguardando primeira localização do aparelho...";
+            return;
+          }
+
+          const coords = track
+            .map(p => [p.lat, p.lon])
+            .filter(([lat, lon]) =>
+              typeof lat === "number" && !isNaN(lat) &&
+              typeof lon === "number" && !isNaN(lon)
+            );
+
+          if (coords.length === 0) {
+            statusEl.textContent = "Aguardando primeira localização válida...";
+            return;
+          }
+
+          const [firstLat, firstLon] = coords[0];
+          const [lastLat, lastLon] = coords[coords.length - 1];
+
+          if (!initialized) {
+            initMap(firstLat, firstLon);
+            initialized = true;
+          }
+
+          polyline.setLatLngs(coords);
+          marker.setLatLng([lastLat, lastLon]);
+
+          const now = new Date();
+          statusEl.textContent = "Última posição de " + (nome || "contato") +
+            " às " + now.toLocaleTimeString();
+
+          if (coords.length > 1) {
+            const bounds = L.latLngBounds(coords);
+            map.fitBounds(bounds, { padding: [20, 20] });
+          } else {
+            map.setView([lastLat, lastLon], 17);
+          }
+        }
+
+        async function poll() {
+          try {
+            const resp = await fetch("/api/live-track/track/" + encodeURIComponent(sessionId));
+            if (!resp.ok) {
+              statusEl.textContent = "Sessão de rastreamento encerrada.";
+              return;
+            }
+            const data = await resp.json();
+            if (data && data.ok) {
+              updateRoute(data.track || [], data.nome);
+            } else {
+              statusEl.textContent = "Aguardando localização...";
+            }
+          } catch (e) {
+            console.error(e);
+            statusEl.textContent = "Erro ao atualizar localização. Tentando novamente...";
+          } finally {
+            setTimeout(poll, 5000);
+          }
+        }
+
+        poll();
+      </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
 
 # ---------------------------------------------------------
 # DB helpers (SQLite)
 # ---------------------------------------------------------
 def db() -> sqlite3.Connection:
-    # check_same_thread=False evita erros se você usar a conexão em tasks/threads
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def db_init():
     with db() as con:
-        con.executescript("""
+        con.executescript(
+            """
         PRAGMA foreign_keys=ON;
 
         ----------------------------------------------------------------------
-        -- DLR de WhatsApp (status de entrega)
+        -- DLR de WhatsApp
         ----------------------------------------------------------------------
         CREATE TABLE IF NOT EXISTS wa_dlr (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,7 +527,7 @@ def db_init():
         ----------------------------------------------------------------------
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE,
             pwd_hash TEXT NOT NULL,
             pwd_salt TEXT NOT NULL,
             email_verified INTEGER DEFAULT 0,
@@ -207,7 +551,7 @@ def db_init():
         );
 
         ----------------------------------------------------------------------
-        -- PROFILE (dados cadastrais — agora com campos opcionais p/ métricas)
+        -- PROFILE
         ----------------------------------------------------------------------
         CREATE TABLE IF NOT EXISTS profiles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -221,7 +565,7 @@ def db_init():
         );
 
         ----------------------------------------------------------------------
-        -- MÉTRICAS (eventos de uso p/ analytics)
+        -- MÉTRICAS
         ----------------------------------------------------------------------
         CREATE TABLE IF NOT EXISTS metrics_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,16 +576,14 @@ def db_init():
             lon REAL,
             created_at TEXT NOT NULL
         );
-
         CREATE INDEX IF NOT EXISTS idx_metrics_created_at ON metrics_events(created_at);
         CREATE INDEX IF NOT EXISTS idx_metrics_event_type ON metrics_events(event_type);
         CREATE INDEX IF NOT EXISTS idx_metrics_channel ON metrics_events(channel);
         CREATE INDEX IF NOT EXISTS idx_metrics_user ON metrics_events(user_id);
 
         ----------------------------------------------------------------------
-        -- CONTATOS (onde ficam destinos de notificação)
+        -- CONTATOS
         ----------------------------------------------------------------------
-        -- contacts.type em ('email','sms','whatsapp','telegram')
         CREATE TABLE IF NOT EXISTS contacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -251,7 +593,6 @@ def db_init():
             status TEXT DEFAULT 'pending',
             created_at TEXT NOT NULL
         );
-
         CREATE INDEX IF NOT EXISTS idx_contacts_user ON contacts(user_id);
         CREATE INDEX IF NOT EXISTS idx_contacts_type ON contacts(type);
 
@@ -263,7 +604,7 @@ def db_init():
         );
 
         ----------------------------------------------------------------------
-        -- AUDITORIA DE DISPAROS (para conferência/forense)
+        -- AUDITORIA DE DISPAROS
         ----------------------------------------------------------------------
         CREATE TABLE IF NOT EXISTS sos_audit (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -277,7 +618,7 @@ def db_init():
         );
 
         ----------------------------------------------------------------------
-        -- DLR de SMS (status de entrega)
+        -- DLR de SMS
         ----------------------------------------------------------------------
         CREATE TABLE IF NOT EXISTS sms_dlr (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -293,7 +634,7 @@ def db_init():
         CREATE INDEX IF NOT EXISTS idx_sms_dlr_received ON sms_dlr(received_at);
 
         ----------------------------------------------------------------------
-        -- SESSÕES DE LIVE LOCATION (um registro por chat)
+        -- SESSÕES DE LIVE LOCATION (Telegram live)
         ----------------------------------------------------------------------
         CREATE TABLE IF NOT EXISTS live_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -304,40 +645,37 @@ def db_init():
             inline_message_id TEXT,
             active INTEGER DEFAULT 1,
             started_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
+            expires_at TEXT NOT NULL,
+            last_lat REAL,
+            last_lon REAL,
+            last_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_live_chat ON live_sessions(chat_id);
         CREATE INDEX IF NOT EXISTS idx_live_active ON live_sessions(active);
-        """)
+        """
+        )
 
-        # Migrações idempotentes (já presentes)
+        # Migrações idempotentes
         try:
-            con.execute("ALTER TABLE profiles ADD COLUMN gender TEXT")
+            con.execute("ALTER TABLE users RENAME TO users_tmp")
         except Exception:
-            pass
-        try:
-            con.execute("ALTER TABLE profiles ADD COLUMN birthdate TEXT")
-        except Exception:
+            # já migrado, ignora
             pass
 
-db_init()
+        # Se o rename acima falhar, tabela continua ok; então criamos de volta se necessário
+        try:
+            cols = [
+                r["name"]
+                for r in con.execute("PRAGMA table_info(users)").fetchall()
+            ]
+        except Exception:
+            cols = []
 
-# --------------------------- MIGRATIONS (email opcional) --------------------
-def migrate_users_email_nullable():
-    """
-    Torna users.email opcional (remove NOT NULL) mantendo UNIQUE.
-    Reconstrói a tabela somente se necessário.
-    """
-    with db() as con:
-        con.row_factory = sqlite3.Row
-        cols = list(con.execute("PRAGMA table_info(users)"))
-        email_col = next((c for c in cols if c["name"] == "email"), None)
-        if not email_col:
-            return
-        if int(email_col["notnull"]) == 1:
-            con.execute("PRAGMA foreign_keys=OFF;")
-            con.executescript("""
-                CREATE TABLE IF NOT EXISTS users_new (
+        # Se não existir, recria com schema correto
+        if not cols:
+            con.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     email TEXT UNIQUE,
                     pwd_hash TEXT NOT NULL,
@@ -345,31 +683,20 @@ def migrate_users_email_nullable():
                     email_verified INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
-                INSERT INTO users_new (id,email,pwd_hash,pwd_salt,email_verified,created_at)
-                SELECT id,email,pwd_hash,pwd_salt,email_verified,created_at FROM users;
-                DROP TABLE users;
-                ALTER TABLE users_new RENAME TO users;
-            """)
-            con.execute("PRAGMA foreign_keys=ON;")
+                """
+            )
 
-def create_optional_indexes():
-    with db() as con:
-        con.executescript("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_user_type_value
-                ON contacts(user_id, type, value);
-        """)
 
-migrate_users_email_nullable()
-create_optional_indexes()
-# ---------------------------------------------------------------------------
+db_init()
 
 # ---------------------------------------------------------
-# Utils: password hash + tokens
+# Utils: password hash
 # ---------------------------------------------------------
-def _hash_password(pwd: str, salt: Optional[bytes] = None) -> (str, str):
+def _hash_password(pwd: str, salt: Optional[bytes] = None) -> Tuple[str, str]:
     salt = salt or secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac("sha256", pwd.encode("utf-8"), salt, 120000)
     return base64.b64encode(dk).decode(), base64.b64encode(salt).decode()
+
 
 def _verify_password(pwd: str, b64hash: str, b64salt: str) -> bool:
     salt = base64.b64decode(b64salt)
@@ -377,33 +704,36 @@ def _verify_password(pwd: str, b64hash: str, b64salt: str) -> bool:
     return hmac.compare_digest(dk2, b64hash)
 
 # ---------------------------------------------------------
-# Templates Telegram (externo com fallback)
+# Templates Telegram
 # ---------------------------------------------------------
 TEMPLATES_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "templates"))
 TG_SOS_TEMPLATE_PATH = os.path.join(TEMPLATES_DIR, "tg_sos.html")
-_DEFAULT_TG_SOS = "<b>🚨 SOS – ANJO DA GUARDA</b>\n$TEXT_LINE\n$MAPS_LINE"
+_DEFAULT_TG_SOS = "<b>🚨 SOS - ANJO DA GUARDA</b>\n$TEXT_LINE\n$MAPS_LINE"
 try:
     with open(TG_SOS_TEMPLATE_PATH, "r", encoding="utf-8") as f:
         _TG_SOS_TEMPLATE = Template(f.read())
 except FileNotFoundError:
     _TG_SOS_TEMPLATE = Template(_DEFAULT_TG_SOS)
 
+
 def render_tg_sos_html(user_text: Optional[str], maps_link: Optional[str]) -> str:
     text_line = _html.escape(user_text) if user_text else ""
     maps_line = _html.escape(maps_link) if maps_link else ""
-    return _TG_SOS_TEMPLATE.safe_substitute(TEXT_LINE=text_line, MAPS_LINE=maps_line).strip()
+    return _TG_SOS_TEMPLATE.safe_substitute(
+        TEXT_LINE=text_line, MAPS_LINE=maps_line
+    ).strip()
 
 # ---------------------------------------------------------
-# Helpers WA: limpeza de MSISDN + envio 1-a-1
+# WhatsApp helpers (Zenvia)
 # ---------------------------------------------------------
 def _msisdn_clean(s: str) -> str:
-    # Zenvia exige DDI+DDD+número sem '+', espaços ou sinais
-    digits = re.sub(r'\D', '', s or '')
-    if digits.startswith('55') and len(digits) >= 12:
+    digits = re.sub(r"\D", "", s or "")
+    if digits.startswith("55") and len(digits) >= 12:
         return digits
-    if len(digits) >= 10 and not digits.startswith('55'):
-        digits = '55' + digits
+    if len(digits) >= 10 and not digits.startswith("55"):
+        digits = "55" + digits
     return digits
+
 
 def _wa_headers_and_proxy():
     token = os.getenv("ZENVIA_API_TOKEN", "").strip()
@@ -415,14 +745,15 @@ def _wa_headers_and_proxy():
         "X-API-Token": token,
         "User-Agent": "curl/8.4.0",
     }
-    proxy = os.getenv("ZENVIA_HTTP_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    proxy = os.getenv("ZENVIA_HTTP_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv(
+        "HTTP_PROXY"
+    )
     proxies = {"http": proxy, "https": proxy} if proxy else None
     return headers, proxies
 
-def send_wa_zenvia_once(_from: str, to: str, text: str) -> dict:
-    import urllib3.util.connection as urllib3_cn
-    urllib3_cn.allowed_gai_family = lambda: socket.AF_INET  # força IPv4
 
+def send_wa_zenvia_once(_from: str, to: str, text: str) -> dict:
+    urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
     url = "https://api.zenvia.com/v2/channels/whatsapp/messages"
     payload = {"from": _from, "to": to, "contents": [{"type": "text", "text": text[:700]}]}
     cb = (os.getenv("ZENVIA_WA_CALLBACK_URL") or os.getenv("ZENVIA_CALLBACK_URL") or "").strip()
@@ -440,34 +771,26 @@ def send_wa_zenvia_once(_from: str, to: str, text: str) -> dict:
         logger.error("[WA] TEXT EXC to=%s %s", to, e)
         return {"ok": False, "reason": str(e), "to": to}
 
-def send_wa_template_zenvia_once(_from: str, to: str, template_id: str, fields: Dict[str, Any]) -> dict:
-    import urllib3.util.connection as urllib3_cn
-    urllib3_cn.allowed_gai_family = lambda: socket.AF_INET  # força IPv4
 
+def send_wa_template_zenvia_once(
+    _from: str, to: str, template_id: str, fields: Dict[str, Any]
+) -> dict:
+    urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
     if not template_id:
         raise RuntimeError("WA_NO_TEMPLATE_ID")
 
     url = "https://api.zenvia.com/v2/channels/whatsapp/messages"
-
-    # sanitiza campos (evita None e garante string)
     f = {k: ("" if v is None else str(v)) for k, v in (fields or {}).items()}
-
     payload = {
         "from": _from,
         "to": _msisdn_clean(to),
-        "contents": [{
-            "type": "template",
-            "templateId": template_id,
-            "fields": f
-        }]
+        "contents": [{"type": "template", "templateId": template_id, "fields": f}],
     }
     cb = (os.getenv("ZENVIA_WA_CALLBACK_URL") or os.getenv("ZENVIA_CALLBACK_URL") or "").strip()
     if cb:
         payload["callbackUrl"] = cb
 
     headers, proxies = _wa_headers_and_proxy()
-
-    # IMPORTANTE: logar depois de montar o payload
     logger.warning("[WA DEBUG PAYLOAD] %s", json.dumps(payload, ensure_ascii=False))
 
     try:
@@ -480,14 +803,23 @@ def send_wa_template_zenvia_once(_from: str, to: str, template_id: str, fields: 
         logger.error("[WA] TPL  EXC to=%s %s", to, e)
         return {"ok": False, "reason": str(e), "to": to}
 
-def send_wa_to_numbers(numbers: List[str], text: str, tpl_fields: Optional[Dict[str, Any]] = None) -> List[dict]:
-    """Envio 1-a-1 para a lista de números do usuário (contatos pessoais)."""
+
+def send_wa_to_numbers(
+    numbers: List[str], text: str, tpl_fields: Optional[Dict[str, Any]] = None
+) -> List[dict]:
     from_alias = (os.getenv("ZENVIA_WA_FROM") or os.getenv("ZENVIA_WHATSAPP_FROM") or "").strip()
     if not from_alias:
         return [{"ok": False, "reason": "WA_FROM_MISSING"}]
     template_id = (os.getenv("ZENVIA_WA_TEMPLATE_ID") or "").strip()
-    use_simple = os.getenv("ZENVIA_WA_SIMPLE", "false").lower() in ("1","true","yes","on")
-    logger.warning("[WA CHOICE] use_simple=%s template_id=%s tpl_fields=%s", use_simple, template_id, json.dumps(tpl_fields, ensure_ascii=False))
+    use_simple = (
+        os.getenv("ZENVIA_WA_SIMPLE", "false").lower() in ("1", "true", "yes", "on")
+    )
+    logger.warning(
+        "[WA CHOICE] use_simple=%s template_id=%s tpl_fields=%s",
+        use_simple,
+        template_id,
+        json.dumps(tpl_fields, ensure_ascii=False) if tpl_fields else None,
+    )
     results = []
     for raw in numbers:
         to = _msisdn_clean(raw)
@@ -499,22 +831,18 @@ def send_wa_to_numbers(numbers: List[str], text: str, tpl_fields: Optional[Dict[
     return results
 
 # ---------------------------------------------------------
-# E-mail (Zoho-friendly, TLS1.2+, STARTTLS/SSL auto)
+# E-mail (Zoho-friendly)
 # ---------------------------------------------------------
-from email.message import EmailMessage
-from email.utils import formataddr, formatdate
-import smtplib, ssl
-from typing import Optional, List, Dict, Any
-
 def send_email(subject: str, body: str, to_list: Optional[List[str]] = None) -> Dict[str, Any]:
     if not CFG.email_enabled:
         return {"ok": False, "reason": "EMAIL_DISABLED"}
 
-    to_list = to_list or ([x.strip() for x in (CFG.email_to_legacy or "").split(",") if x.strip()])
+    to_list = to_list or (
+        [x.strip() for x in (CFG.email_to_legacy or "").split(",") if x.strip()]
+    )
     if not to_list:
         return {"ok": False, "reason": "EMAIL_NO_RECIPIENTS"}
 
-    # Monta mensagem
     msg = EmailMessage()
     from_name = (os.getenv("EMAIL_FROM_NAME") or "").strip()
     from_addr = CFG.email_from
@@ -522,20 +850,15 @@ def send_email(subject: str, body: str, to_list: Optional[List[str]] = None) -> 
     msg["To"] = ", ".join(to_list)
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
-    # Opcional: reply-to se existir no .env
     reply_to = (os.getenv("EMAIL_REPLY_TO") or "").strip()
     if reply_to:
         msg["Reply-To"] = reply_to
-    # Boa prática p/ Zoho: remetente autenticado
     msg["Sender"] = CFG.smtp_user
-
-    # UTF-8 garante acentos/emoji no corpo
     msg.set_content(body, charset="utf-8")
 
-    # TLS 1.2+
     ctx = ssl.create_default_context()
     try:
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # Python 3.7+
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     except Exception:
         pass
 
@@ -575,20 +898,23 @@ def send_email(subject: str, body: str, to_list: Optional[List[str]] = None) -> 
 
         logger.error(
             "[EMAIL] FALHA DEFINITIVA host=%s port=%s user=%s from=%s err=%s",
-            CFG.smtp_host, CFG.smtp_port, CFG.smtp_user, from_addr, " | ".join(tried)
+            CFG.smtp_host,
+            CFG.smtp_port,
+            CFG.smtp_user,
+            from_addr,
+            " | ".join(tried),
         )
         return {"ok": False, "reason": "EMAIL_SEND_FAILED", "errors": tried}
 
-
 # ---------------------------------------------------------
-# Zenvia (SMS) - legado/env
+# SMS Zenvia (legado/env)
 # ---------------------------------------------------------
 def _resolve_sms_sender() -> str:
     return (os.getenv("ZENVIA_SMS_FROM") or os.getenv("ZENVIA_FROM") or "glaucusmotta").strip()
 
+
 def send_sms_zenvia_once(_from: str, to: str, text: str) -> dict:
-    import urllib3.util.connection as urllib3_cn
-    urllib3_cn.allowed_gai_family = lambda: socket.AF_INET  # força IPv4
+    urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
     token = os.getenv("ZENVIA_API_TOKEN", "").strip()
     if not token:
@@ -608,7 +934,9 @@ def send_sms_zenvia_once(_from: str, to: str, text: str) -> dict:
         "User-Agent": "curl/8.4.0",
     }
 
-    proxy = os.getenv("ZENVIA_HTTP_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    proxy = os.getenv("ZENVIA_HTTP_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv(
+        "HTTP_PROXY"
+    )
     proxies = {"http": proxy, "https": proxy} if proxy else None
 
     try:
@@ -620,7 +948,13 @@ def send_sms_zenvia_once(_from: str, to: str, text: str) -> dict:
             m = re.search(r"Ray ID:\s*<strong[^>]*>([^<]+)</strong>", raw)
             ray = m.group(1) if m else None
             logger.error("[SMS] CLOUDFLARE_WAF_BLOCK to=%s ray=%s", to, ray)
-            return {"ok": False, "status": 403, "reason": "CLOUDFLARE_WAF_BLOCK", "ray_id": ray, "to": to}
+            return {
+                "ok": False,
+                "status": 403,
+                "reason": "CLOUDFLARE_WAF_BLOCK",
+                "ray_id": ray,
+                "to": to,
+            }
 
         logger.info("[SMS] to=%s status=%s ok=%s resp=%s", to, resp.status_code, ok, raw)
         return {"ok": ok, "status": resp.status_code, "response": raw, "to": to}
@@ -628,16 +962,19 @@ def send_sms_zenvia_once(_from: str, to: str, text: str) -> dict:
         logger.error("[SMS] EXC to=%s %s", to, e)
         return {"ok": False, "reason": str(e), "to": to}
 
+
 def send_sms_zenvia_list(text: str) -> list:
     from_alias = _resolve_sms_sender()
-    to_list = [x.strip() for x in os.getenv("ZENVIA_SMS_TO_LIST", "").split(",") if x.strip()]
+    to_list = [
+        x.strip() for x in os.getenv("ZENVIA_SMS_TO_LIST", "").split(",") if x.strip()
+    ]
     results = []
     for to_raw in to_list:
         results.append(send_sms_zenvia_once(from_alias, _msisdn_clean(to_raw), text))
     return results
 
 # ---------------------------------------------------------
-# Zenvia (WhatsApp) - legado/env (listas do .env)
+# WA Zenvia (legado/env)
 # ---------------------------------------------------------
 def send_wa_zenvia_list(text: str) -> list:
     from_alias = (os.getenv("ZENVIA_WA_FROM") or os.getenv("ZENVIA_WHATSAPP_FROM") or "").strip()
@@ -648,6 +985,7 @@ def send_wa_zenvia_list(text: str) -> list:
         results.append(send_wa_zenvia_once(from_alias, _msisdn_clean(to), text))
     return results
 
+
 def send_wa_zenvia_list_template(fields: Dict[str, Any]) -> list:
     from_alias = (os.getenv("ZENVIA_WA_FROM") or os.getenv("ZENVIA_WHATSAPP_FROM") or "").strip()
     to_raw = (os.getenv("ZENVIA_WA_TO_LIST") or os.getenv("ZENVIA_WHATSAPP_TO_LIST") or "").strip()
@@ -655,7 +993,9 @@ def send_wa_zenvia_list_template(fields: Dict[str, Any]) -> list:
     to_list = [x.strip() for x in to_raw.split(",") if x.strip()]
     results = []
     for to in to_list:
-        results.append(send_wa_template_zenvia_once(from_alias, _msisdn_clean(to), template_id, fields))
+        results.append(
+            send_wa_template_zenvia_once(from_alias, _msisdn_clean(to), template_id, fields)
+        )
     return results
 
 # ---------------------------------------------------------
@@ -665,22 +1005,29 @@ def _parse_chat_ids_from_env() -> List[str]:
     raw = (CFG.tg_chat_ids or "").strip()
     tokens: List[str] = []
     if raw:
-        tokens = [t.strip() for t in re.split(r"[,\s;]+", raw) if t.strip()]
+        tokens = [t.strip() for t in re.split(r"[,\\s;]+", raw) if t.strip()]
     elif CFG.tg_chat_id_legacy:
         tokens = [CFG.tg_chat_id_legacy.strip()]
 
     valid: List[str] = []
     for t in tokens:
         if t.startswith("@"):
-            valid.append(t); continue
+            valid.append(t)
+            continue
         try:
-            int(t); valid.append(t)
+            int(t)
+            valid.append(t)
         except ValueError:
             logger.error("[TG] chat_id inválido ignorado: %r", t)
     return valid
 
-def _send_telegram_once(chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = None,
-                        parse_mode: Optional[str] = "HTML") -> Dict[str, Any]:
+
+def _send_telegram_once(
+    chat_id: str,
+    text: str,
+    reply_markup: Optional[Dict[str, Any]] = None,
+    parse_mode: Optional[str] = "HTML",
+) -> Dict[str, Any]:
     if not CFG.tg_enabled:
         return {"ok": False, "reason": "TELEGRAM_DISABLED", "chat_id": chat_id}
     if not CFG.tg_token:
@@ -691,7 +1038,11 @@ def _send_telegram_once(chat_id: str, text: str, reply_markup: Optional[Dict[str
         return {"ok": False, "reason": "TEXT_EMPTY", "chat_id": chat_id}
 
     url = f"https://api.telegram.org/bot{CFG.tg_token}/sendMessage"
-    payload: Dict[str, Any] = {"chat_id": chat_id, "text": txt[:4096], "disable_web_page_preview": True}
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": txt[:4096],
+        "disable_web_page_preview": True,
+    }
     if parse_mode:
         payload["parse_mode"] = parse_mode
     if reply_markup:
@@ -707,13 +1058,23 @@ def _send_telegram_once(chat_id: str, text: str, reply_markup: Optional[Dict[str
     except HTTPError as e:
         raw = e.read().decode("utf-8", "ignore") if e.fp else ""
         logger.error("[TG] HTTP %s chat=%s %s", e.code, chat_id, raw)
-        return {"ok": False, "reason": f"HTTP {e.code}", "response": raw, "chat_id": chat_id}
+        return {
+            "ok": False,
+            "reason": f"HTTP {e.code}",
+            "response": raw,
+            "chat_id": chat_id,
+        }
     except URLError as e:
         logger.error("[TG] URLERROR chat=%s %s", chat_id, getattr(e, "reason", str(e)))
-        return {"ok": False, "reason": f"URLERROR {getattr(e, 'reason', str(e))}", "chat_id": chat_id}
+        return {
+            "ok": False,
+            "reason": f"URLERROR {getattr(e, 'reason', str(e))}",
+            "chat_id": chat_id,
+        }
     except Exception as e:
         logger.error("[TG] EXC chat=%s %s", chat_id, e)
         return {"ok": False, "reason": str(e), "chat_id": chat_id}
+
 
 def _send_telegram_location_once(chat_id: str, lat: float, lon: float) -> Dict[str, Any]:
     if not CFG.tg_enabled:
@@ -733,18 +1094,71 @@ def _send_telegram_location_once(chat_id: str, lat: float, lon: float) -> Dict[s
     except HTTPError as e:
         raw = e.read().decode("utf-8", "ignore") if e.fp else ""
         logger.error("[TG] LOC HTTP %s chat=%s %s", e.code, chat_id, raw)
-        return {"ok": False, "reason": f"HTTP {e.code}", "response": raw, "chat_id": chat_id}
+        return {
+            "ok": False,
+            "reason": f"HTTP {e.code}",
+            "response": raw,
+            "chat_id": chat_id,
+        }
     except URLError as e:
         logger.error("[TG] LOC URLERROR chat=%s %s", chat_id, getattr(e, "reason", str(e)))
-        return {"ok": False, "reason": f"URLERROR {getattr(e, 'reason', str(e))}", "chat_id": chat_id}
+        return {
+            "ok": False,
+            "reason": f"URLERROR {getattr(e, 'reason', str(e))}",
+            "chat_id": chat_id,
+        }
     except Exception as e:
         logger.error("[TG] LOC EXC chat=%s %s", chat_id, e)
         return {"ok": False, "reason": str(e), "chat_id": chat_id}
 
-# -------------------------------------------------------
-#  Telegram: Live Location
-# -------------------------------------------------------
-def _send_telegram_live_start_once(chat_id: str, lat: float, lon: float, live_period: int = 900):
+# ---------------------------------------------------------
+# Live Location Telegram (/api/live/* e /track/<live_id>)
+# ---------------------------------------------------------
+class LiveStartIn(BaseModel):
+    lat: float
+    lon: float
+    duration: int = 900
+    user_email: Optional[str] = None
+
+
+class LiveUpdateIn(BaseModel):
+    live_id: str
+    lat: float
+    lon: float
+
+
+class LiveStopIn(BaseModel):
+    live_id: str
+
+
+def _live_destinations_for(user_email: Optional[str]):
+    user_id = None
+    chat_ids: List[str] = []
+    if user_email:
+        with db() as con:
+            row = con.execute(
+                "SELECT id, email_verified FROM users WHERE email=?",
+                (user_email.strip().lower(),),
+            ).fetchone()
+            if row and row["email_verified"]:
+                user_id = row["id"]
+                rows = con.execute(
+                    """
+                    SELECT tc.chat_id FROM telegram_contacts tc
+                    JOIN contacts c ON c.id = tc.contact_id
+                    WHERE c.user_id=? AND c.type='telegram' AND c.status='active' AND tc.chat_id IS NOT NULL
+                """,
+                    (user_id,),
+                ).fetchall()
+                chat_ids = [r["chat_id"] for r in rows]
+    if not chat_ids:
+        chat_ids = _parse_chat_ids_from_env()
+    return user_id, chat_ids
+
+
+def _send_telegram_live_start_once(
+    chat_id: str, lat: float, lon: float, live_period: int = 900
+):
     if not CFG.tg_enabled or not CFG.tg_token:
         return {"ok": False, "reason": "TELEGRAM_DISABLED_OR_NO_TOKEN", "chat_id": chat_id}
     url = f"https://api.telegram.org/bot{CFG.tg_token}/sendLocation"
@@ -765,14 +1179,26 @@ def _send_telegram_live_start_once(chat_id: str, lat: float, lon: float, live_pe
                 mid = j.get("result", {}).get("message_id")
             except Exception:
                 mid = None
-            return {"ok": True, "status": resp.status, "response": raw, "chat_id": chat_id, "message_id": mid}
+            return {
+                "ok": True,
+                "status": resp.status,
+                "response": raw,
+                "chat_id": chat_id,
+                "message_id": mid,
+            }
     except HTTPError as e:
         raw = e.read().decode("utf-8", "ignore") if e.fp else ""
         logger.error("[TG] LIVE START HTTP %s chat=%s %s", e.code, chat_id, raw)
-        return {"ok": False, "reason": f"HTTP {e.code}", "response": raw, "chat_id": chat_id}
+        return {
+            "ok": False,
+            "reason": f"HTTP {e.code}",
+            "response": raw,
+            "chat_id": chat_id,
+        }
     except Exception as e:
         logger.error("[TG] LIVE START EXC chat=%s %s", chat_id, e)
         return {"ok": False, "reason": str(e), "chat_id": chat_id}
+
 
 def _edit_telegram_live_once(chat_id: str, message_id: int, lat: float, lon: float):
     if not CFG.tg_enabled or not CFG.tg_token:
@@ -794,10 +1220,16 @@ def _edit_telegram_live_once(chat_id: str, message_id: int, lat: float, lon: flo
     except HTTPError as e:
         raw = e.read().decode("utf-8", "ignore") if e.fp else ""
         logger.error("[TG] LIVE EDIT HTTP %s chat=%s msg=%s %s", e.code, chat_id, message_id, raw)
-        return {"ok": False, "reason": f"HTTP {e.code}", "response": raw, "chat_id": chat_id}
+        return {
+            "ok": False,
+            "reason": f"HTTP {e.code}",
+            "response": raw,
+            "chat_id": chat_id,
+        }
     except Exception as e:
         logger.error("[TG] LIVE EDIT EXC chat=%s msg=%s %s", chat_id, e)
         return {"ok": False, "reason": str(e), "chat_id": chat_id}
+
 
 def _stop_telegram_live_once(chat_id: str, message_id: int):
     if not CFG.tg_enabled or not CFG.tg_token:
@@ -814,89 +1246,309 @@ def _stop_telegram_live_once(chat_id: str, message_id: int):
     except HTTPError as e:
         raw = e.read().decode("utf-8", "ignore") if e.fp else ""
         logger.error("[TG] LIVE STOP HTTP %s chat=%s msg=%s %s", e.code, chat_id, message_id, raw)
-        return {"ok": False, "reason": f"HTTP {e.code}", "response": raw, "chat_id": chat_id}
+        return {
+            "ok": False,
+            "reason": f"HTTP {e.code}",
+            "response": raw,
+            "chat_id": chat_id,
+        }
     except Exception as e:
         logger.error("[TG] LIVE STOP EXC chat=%s msg=%s %s", chat_id, e)
         return {"ok": False, "reason": str(e), "chat_id": chat_id}
 
+
+@app.post("/api/live/start")
+def live_start(payload: LiveStartIn):
+    if not CFG.tg_enabled:
+        return JSONResponse(
+            status_code=400, content={"ok": False, "reason": "TELEGRAM_DISABLED"}
+        )
+    user_id, chat_ids = _live_destinations_for(payload.user_email)
+    if not chat_ids:
+        return JSONResponse(
+            status_code=400, content={"ok": False, "reason": "NO_CHAT_IDS"}
+        )
+
+    live_id = secrets.token_urlsafe(10)
+    expires = (
+        datetime.utcnow()
+        + timedelta(seconds=min(max(payload.duration, 60), 86400))
+    ).isoformat()
+
+    results = []
+    any_ok = False
+    for cid in chat_ids:
+        r = _send_telegram_live_start_once(
+            cid, float(payload.lat), float(payload.lon), payload.duration
+        )
+        results.append(r)
+        if r.get("ok"):
+            any_ok = True
+        mid = r.get("message_id")
+
+        if r.get("ok") and mid:
+            try:
+                with db() as con:
+                    con.execute(
+                        """
+                        INSERT INTO live_sessions
+                          (user_id, session_token, chat_id, message_id, active,
+                           started_at, expires_at, last_lat, last_lon, last_at)
+                        VALUES (?,?,?,?,1,?,?,?,?,?)
+                    """,
+                        (
+                            user_id,
+                            live_id,
+                            str(cid),
+                            int(mid),
+                            _now(),
+                            expires,
+                            float(payload.lat),
+                            float(payload.lon),
+                            _now(),
+                        ),
+                    )
+            except Exception as e:
+                logger.error(
+                    "[DB] LIVE INSERT ERROR token=%s chat_id=%s msg_id=%s err=%s",
+                    live_id,
+                    cid,
+                    mid,
+                    e,
+                )
+                results.append(
+                    {"ok": False, "reason": f"DB_ERROR: {e}", "chat_id": cid}
+                )
+
+    return JSONResponse(
+        status_code=200 if any_ok else 500,
+        content={"ok": any_ok, "live_id": live_id, "results": results},
+    )
+
+
+@app.post("/api/live/update")
+def live_update(payload: LiveUpdateIn):
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT chat_id, message_id FROM live_sessions
+            WHERE session_token=? AND active=1
+        """,
+            (payload.live_id,),
+        ).fetchall()
+    if not rows:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "reason": "LIVE_NOT_FOUND_OR_INACTIVE"},
+        )
+
+    results = []
+    any_ok = False
+    for r in rows:
+        res = _edit_telegram_live_once(
+            str(r["chat_id"]),
+            int(r["message_id"]),
+            float(payload.lat),
+            float(payload.lon),
+        )
+        results.append(res)
+        any_ok = any_ok or res.get("ok", False)
+
+    with db() as con:
+        con.execute(
+            """
+            UPDATE live_sessions
+            SET last_lat=?, last_lon=?, last_at=?
+            WHERE session_token=? AND active=1
+        """,
+            (float(payload.lat), float(payload.lon), _now(), payload.live_id),
+        )
+
+    return {"ok": any_ok, "results": results}
+
+
+@app.post("/api/live/stop")
+def live_stop(payload: LiveStopIn):
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT chat_id, message_id FROM live_sessions
+            WHERE session_token=? AND active=1
+        """,
+            (payload.live_id,),
+        ).fetchall()
+    if not rows:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "reason": "LIVE_NOT_FOUND_OR_INACTIVE"},
+        )
+
+    results = []
+    any_ok = False
+    for r in rows:
+        res = _stop_telegram_live_once(
+            str(r["chat_id"]), int(r["message_id"])
+        )
+        results.append(res)
+        any_ok = any_ok or res.get("ok", False)
+
+    with db() as con:
+        con.execute(
+            "UPDATE live_sessions SET active=0 WHERE session_token=?",
+            (payload.live_id,),
+        )
+    return {"ok": any_ok, "results": results}
+
+
+@app.get("/api/live/state/{live_id}")
+def live_state(live_id: str):
+    with db() as con:
+        row = con.execute(
+            """
+            SELECT session_token, active, expires_at, last_lat, last_lon, last_at
+            FROM live_sessions
+            WHERE session_token=?
+        """,
+            (live_id,),
+        ).fetchone()
+
+    if not row:
+        return JSONResponse(
+            status_code=404, content={"ok": False, "reason": "LIVE_NOT_FOUND"}
+        )
+
+    active = bool(row["active"])
+    expired = False
+    try:
+        expired = datetime.utcnow() > datetime.fromisoformat(row["expires_at"])
+    except Exception:
+        pass
+    if expired:
+        active = False
+
+    return {
+        "ok": True,
+        "live_id": row["session_token"],
+        "active": active,
+        "expired": expired,
+        "lat": row["last_lat"],
+        "lon": row["last_lon"],
+        "last_at": row["last_at"],
+    }
+
+
+@app.get("/track/{live_id}", response_class=HTMLResponse)
+def track_page(live_id: str):
+    html = f"""
+    <html>
+    <head>
+      <meta charset="utf-8"/>
+      <title>Rastreamento - Anjo da Guarda</title>
+      <style>
+        body {{ font-family: Arial, sans-serif; max-width: 720px; margin: 20px auto; padding: 0 10px; }}
+        #map-container {{ margin-top: 16px; }}
+        iframe {{ width: 100%; height: 420px; border: 0; }}
+        #status {{ font-size: 14px; color: #444; margin-top: 8px; }}
+      </style>
+    </head>
+    <body>
+      <h2>Rastreamento em tempo quase real</h2>
+      <p>Este link foi enviado pelo app <b>Anjo da Guarda</b>. A posição pode ser atualizada a cada poucos segundos.</p>
+      <div id="status">Carregando posição...</div>
+      <div id="map-container">
+        <iframe id="map-frame" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>
+      </div>
+      <script>
+        const liveId = "{live_id}";
+        async function refresh() {{
+          try {{
+            const resp = await fetch("/api/live/state/" + encodeURIComponent(liveId));
+            if (!resp.ok) {{
+              document.getElementById("status").innerText = "Rastreamento não encontrado ou encerrado.";
+              return;
+            }}
+            const data = await resp.json();
+            if (!data.active || !data.lat || !data.lon) {{
+              document.getElementById("status").innerText = "Rastreamento inativo ou sem posição ainda.";
+              return;
+            }}
+            const lat = data.lat;
+            const lon = data.lon;
+            document.getElementById("status").innerText =
+              "Rastreamento ativo. Última atualização: " + (data.last_at || "");
+            const url = "https://maps.google.com/maps?q=" + lat + "," + lon + "&z=16&output=embed";
+            document.getElementById("map-frame").src = url;
+          }} catch (e) {{
+            document.getElementById("status").innerText = "Erro ao carregar posição.";
+          }}
+        }}
+        refresh();
+        setInterval(refresh, 10000);
+      </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
 # ---------------------------------------------------------
-# MODELOS
+# MODELOS SOS / AUTH / ONBOARDING
 # ---------------------------------------------------------
 class SosIn(BaseModel):
     lat: Optional[float] = None
     lon: Optional[float] = None
-    acc: Optional[float] = None          # mantido para e-mail/Telegram; NÃO vai no template
+    acc: Optional[float] = None
     text: Optional[str] = None
     nome: Optional[str] = None
-    s1: Optional[str] = None             # pode carregar 'nome' se quiser
+    s1: Optional[str] = None
     s2: Optional[str] = None
-    user_email: Optional[str] = None     # se vier, usa contatos do usuário
-
-class RegisterIn(BaseModel):
-    email: Optional[str] = None          # agora OPCIONAL
-    password: str
-
-class ProfileIn(BaseModel):
-    token: str
-    full_name: str
-    cpf: str
-    address: str
-
-class ContactsIn(BaseModel):
-    token: str
-    emails: List[str] = []
-    sms: List[str] = []
-    whatsapp: List[str] = []
-    telegram: List[str] = []  # OPCIONAL
-
-# Live models
-class LiveStartIn(BaseModel):
-    lat: float
-    lon: float
-    duration: int = 900
     user_email: Optional[str] = None
 
-class LiveUpdateIn(BaseModel):
-    live_id: str
-    lat: float
-    lon: float
 
-class LiveStopIn(BaseModel):
-    live_id: str
+class RegisterIn(BaseModel):
+    email: Optional[str] = None
+    password: str
 
 # ---------------------------------------------------------
-# AUTH: registro + confirmação por e-mail + termos LGPD
+# AUTH: registro + confirmação + consentimento
 # ---------------------------------------------------------
 @app.post("/auth/register")
 def auth_register(payload: RegisterIn):
     email = (payload.email or "").strip().lower()
     pwd = payload.password
     if not pwd:
-        return JSONResponse(status_code=400, content={"ok": False, "reason": "PASSWORD_EMPTY"})
+        return JSONResponse(
+            status_code=400, content={"ok": False, "reason": "PASSWORD_EMPTY"}
+        )
 
     with db() as con:
         if email:
             cur = con.execute("SELECT id FROM users WHERE email=?", (email,))
             if cur.fetchone():
-                return JSONResponse(status_code=400, content={"ok": False, "reason": "EMAIL_EXISTS"})
+                return JSONResponse(
+                    status_code=400, content={"ok": False, "reason": "EMAIL_EXISTS"}
+                )
 
         h, salt = _hash_password(pwd)
         email_verified = 0 if email else 1
 
         con.execute(
             "INSERT INTO users(email,pwd_hash,pwd_salt,email_verified,created_at) VALUES(?,?,?,?,?)",
-            (email if email else None, h, salt, email_verified, _now())
+            (email if email else None, h, salt, email_verified, _now()),
         )
-        uid = con.execute("SELECT id FROM users ORDER BY id DESC LIMIT 1").fetchone()["id"]
+        uid = con.execute(
+            "SELECT id FROM users ORDER BY id DESC LIMIT 1"
+        ).fetchone()["id"]
 
         if email:
             token = secrets.token_urlsafe(20)
             expires = (datetime.utcnow() + timedelta(hours=24)).isoformat()
-            con.execute("INSERT INTO email_tokens(user_id, token, created_at, expires_at) VALUES(?,?,?,?)",
-                        (uid, token, _now(), expires))
+            con.execute(
+                "INSERT INTO email_tokens(user_id, token, created_at, expires_at) VALUES(?,?,?,?)",
+                (uid, token, _now(), expires),
+            )
             confirm_link = f"{CFG.public_base_url}/auth/confirm?token={token}"
 
-            subject = "Confirme seu cadastro – Anjo da Guarda"
+            subject = "Confirme seu cadastro - Anjo da Guarda"
             body = f"""Olá!
 
 Recebemos um pedido de cadastro no Anjo da Guarda para {email}.
@@ -909,6 +1561,7 @@ Se não foi você, ignore este e-mail.
             send_email(subject, body, [email])
 
     return {"ok": True, "email_verification": "sent" if email else "skipped"}
+
 
 @app.get("/auth/confirm")
 def auth_confirm(token: str):
@@ -926,13 +1579,18 @@ def auth_confirm(token: str):
     """
     return HTMLResponse(content=html)
 
+
 @app.post("/auth/consent")
-def auth_consent(token: str = Form(...), agree: Optional[str] = Form(None), request: Request = None):
+def auth_consent(
+    token: str = Form(...), agree: Optional[str] = Form(None), request: Request = None
+):
     if agree != "on":
         return HTMLResponse("<h3>Você precisa concordar para continuar.</h3>", status_code=400)
 
     with db() as con:
-        row = con.execute("SELECT user_id, used, expires_at FROM email_tokens WHERE token=?", (token,)).fetchone()
+        row = con.execute(
+            "SELECT user_id, used, expires_at FROM email_tokens WHERE token=?", (token,),
+        ).fetchone()
         if not row:
             return HTMLResponse("<h3>Token inválido.</h3>", status_code=400)
         if row["used"]:
@@ -944,13 +1602,20 @@ def auth_consent(token: str = Form(...), agree: Optional[str] = Form(None), requ
         con.execute("UPDATE users SET email_verified=1 WHERE id=?", (uid,))
         con.execute("UPDATE email_tokens SET used=1 WHERE token=?", (token,))
         ip = request.client.host if request and request.client else None
-        con.execute("INSERT INTO consents(user_id, consent_at, ip) VALUES(?,?,?)", (uid, _now(), ip))
+        con.execute(
+            "INSERT INTO consents(user_id, consent_at, ip) VALUES(?,?,?)", (uid, _now(), ip)
+        )
 
     return RedirectResponse(url=f"/onboarding/profile?token={token}", status_code=302)
 
+# ---------------------------------------------------------
+# Debug Zenvia config
+# ---------------------------------------------------------
 @app.get("/debug/zenvia_conf")
 def debug_zenvia_conf():
-    to_list = [x.strip() for x in (os.getenv("ZENVIA_WA_TO_LIST") or "").split(",") if x.strip()]
+    to_list = [
+        x.strip() for x in (os.getenv("ZENVIA_WA_TO_LIST") or "").split(",") if x.strip()
+    ]
     return {
         "wa_from": os.getenv("ZENVIA_WA_FROM", ""),
         "wa_to_list": to_list,
@@ -960,9 +1625,8 @@ def debug_zenvia_conf():
         "token_set": bool(os.getenv("ZENVIA_API_TOKEN", "").strip()),
     }
 
-
 # ---------------------------------------------------------
-# Perfil
+# Onboarding: perfil + contatos (mantive apenas fluxo básico)
 # ---------------------------------------------------------
 @app.get("/onboarding/profile")
 def profile_form(token: str):
@@ -980,26 +1644,36 @@ def profile_form(token: str):
     """
     return HTMLResponse(html)
 
+
 @app.post("/onboarding/profile")
-def profile_save(token: str = Form(...), full_name: str = Form(...), cpf: str = Form(...), address: str = Form(...)):
+def profile_save(
+    token: str = Form(...),
+    full_name: str = Form(...),
+    cpf: str = Form(...),
+    address: str = Form(...),
+):
     with db() as con:
-        row = con.execute("SELECT user_id FROM email_tokens WHERE token=? AND used=1", (token,)).fetchone()
+        row = con.execute(
+            "SELECT user_id FROM email_tokens WHERE token=? AND used=1", (token,),
+        ).fetchone()
         if not row:
             return HTMLResponse("<h3>Token inválido.</h3>", status_code=400)
         uid = row["user_id"]
         existing = con.execute("SELECT id FROM profiles WHERE user_id=?", (uid,)).fetchone()
         if existing:
-            con.execute("UPDATE profiles SET full_name=?, cpf=?, address=? WHERE user_id=?",
-                        (full_name, cpf, address, uid))
+            con.execute(
+                "UPDATE profiles SET full_name=?, cpf=?, address=? WHERE user_id=?",
+                (full_name, cpf, address, uid),
+            )
         else:
-            con.execute("INSERT INTO profiles(user_id, full_name, cpf, address, created_at) VALUES(?,?,?,?,?)",
-                        (uid, full_name, cpf, address, _now()))
+            con.execute(
+                "INSERT INTO profiles(user_id, full_name, cpf, address, created_at) VALUES(?,?,?,?,?)",
+                (uid, full_name, cpf, address, _now()),
+            )
 
     return RedirectResponse(url=f"/onboarding/contacts?token={token}", status_code=302)
 
-# ---------------------------------------------------------
-# Contatos
-# ---------------------------------------------------------
+
 @app.get("/onboarding/contacts")
 def contacts_form(token: str):
     html = f"""
@@ -1036,6 +1710,7 @@ def contacts_form(token: str):
     """
     return HTMLResponse(html)
 
+
 @app.post("/onboarding/contacts")
 async def contacts_save(request: Request):
     form = await request.form()
@@ -1048,10 +1723,15 @@ async def contacts_save(request: Request):
     if not token:
         return HTMLResponse("<h3>Token ausente.</h3>", status_code=400)
     if len(sms) < 1 or len(whatsapp) < 1:
-        return HTMLResponse("<h3>Preencha ao menos 1 SMS e 1 WhatsApp (e-mail é opcional).</h3>", status_code=400)
+        return HTMLResponse(
+            "<h3>Preencha ao menos 1 SMS e 1 WhatsApp (e-mail é opcional).</h3>",
+            status_code=400,
+        )
 
     with db() as con:
-        row = con.execute("SELECT user_id FROM email_tokens WHERE token=? AND used=1", (token,)).fetchone()
+        row = con.execute(
+            "SELECT user_id FROM email_tokens WHERE token=? AND used=1", (token,),
+        ).fetchone()
         if not row:
             return HTMLResponse("<h3>Token inválido.</h3>", status_code=400)
         uid = row["user_id"]
@@ -1062,7 +1742,7 @@ async def contacts_save(request: Request):
             for i, v in enumerate(lst[:3]):
                 con.execute(
                     "INSERT INTO contacts(user_id, type, value, is_primary, status, created_at) VALUES(?,?,?,?,?,?)",
-                    (uid, ctype, v, 1 if i == 0 else 0, "pending", _now())
+                    (uid, ctype, v, 1 if i == 0 else 0, "pending", _now()),
                 )
 
         add_contacts(emails, "email")
@@ -1074,19 +1754,33 @@ async def contacts_save(request: Request):
             for i, label in enumerate(telegram[:3]):
                 con.execute(
                     "INSERT INTO contacts(user_id, type, value, is_primary, status, created_at) VALUES(?,?,?,?,?,?)",
-                    (uid, "telegram", label or f"telegram_{i+1}", 1 if i == 0 else 0, "pending", _now())
+                    (
+                        uid,
+                        "telegram",
+                        label or f"telegram_{i+1}",
+                        1 if i == 0 else 0,
+                        "pending",
+                        _now(),
+                    ),
                 )
                 cid = con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
                 act = secrets.token_urlsafe(16)
-                con.execute("INSERT INTO telegram_contacts(contact_id, activation_token) VALUES(?,?)", (cid, act))
+                con.execute(
+                    "INSERT INTO telegram_contacts(contact_id, activation_token) VALUES(?,?)",
+                    (cid, act),
+                )
                 if CFG.tg_bot_username:
                     tg_link = f"https://t.me/{CFG.tg_bot_username}?start={act}"
                 else:
                     tg_link = f"https://t.me/<SEU_BOT>?start={act}"
                 tg_links.append((label or f"Contato {i+1}", tg_link))
 
-    li = "".join([f'<li>{_html.escape(name)}: <a href="{_html.escape(url)}" target="_blank">{_html.escape(url)}</a></li>'
-                  for name, url in tg_links]) or "<li>(Nenhum contato de Telegram cadastrado)</li>"
+    li = "".join(
+        [
+            f'<li>{_html.escape(name)}: <a href="{_html.escape(url)}" target="_blank">{_html.escape(url)}</a></li>'
+            for name, url in tg_links
+        ]
+    ) or "<li>(Nenhum contato de Telegram cadastrado)</li>"
 
     html = f"""
     <html><body style="font-family:Arial;max-width:820px;margin:40px auto;">
@@ -1101,7 +1795,7 @@ async def contacts_save(request: Request):
     return HTMLResponse(html)
 
 # ---------------------------------------------------------
-# Webhook do Telegram (captura /start <token>)
+# Webhook Telegram (ativação de contatos Telegram)
 # ---------------------------------------------------------
 @app.post("/webhooks/telegram")
 async def telegram_webhook(update: Dict[str, Any], bg: BackgroundTasks):
@@ -1115,34 +1809,45 @@ async def telegram_webhook(update: Dict[str, Any], bg: BackgroundTasks):
         token = parts[1] if len(parts) > 1 else None
         if token:
             with db() as con:
-                row = con.execute("""
+                row = con.execute(
+                    """
                     SELECT c.id AS contact_id, c.user_id
                     FROM telegram_contacts tc
                     JOIN contacts c ON c.id = tc.contact_id
                     WHERE tc.activation_token=? AND c.type='telegram'
-                """, (token,)).fetchone()
+                """,
+                    (token,),
+                ).fetchone()
                 if row:
-                    con.execute("UPDATE telegram_contacts SET chat_id=?, activated_at=? WHERE contact_id=?",
-                                (chat_id, _now(), row["contact_id"]))
-                    con.execute("UPDATE contacts SET status='active' WHERE id=?", (row["contact_id"],))
-                    bg.add_task(_send_telegram_once, chat_id,
-                                "<b>Notificações ativadas!</b>\nVocê passará a receber alertas SOS deste aplicativo.",
-                                None, "HTML")
+                    con.execute(
+                        "UPDATE telegram_contacts SET chat_id=?, activated_at=? WHERE contact_id=?",
+                        (chat_id, _now(), row["contact_id"]),
+                    )
+                    con.execute(
+                        "UPDATE contacts SET status='active' WHERE id=?",
+                        (row["contact_id"],),
+                    )
+                    bg.add_task(
+                        _send_telegram_once,
+                        chat_id,
+                        "<b>Notificações ativadas!</b>\nVocê passará a receber alertas SOS deste aplicativo.",
+                        None,
+                        "HTML",
+                    )
         else:
-            _send_telegram_once(chat_id,
-                                "Olá! Para ativar, toque no link de convite enviado pelo aplicativo.",
-                                None, None)
+            _send_telegram_once(
+                chat_id,
+                "Olá! Para ativar, toque no link de convite enviado pelo aplicativo.",
+                None,
+                None,
+            )
     return {"ok": True}
 
 # ---------------------------------------------------------
-# Webhook Zenvia (DLR) — grava SMS em sms_dlr e WA em wa_dlr
+# Webhook Zenvia (DLR)
 # ---------------------------------------------------------
 @app.post("/webhooks/zenvia")
 async def zenvia_webhook(request: Request):
-    """
-    Aceita callbacks da Zenvia (SMS/WhatsApp), em dict OU lista de dicts.
-    Grava SMS em sms_dlr e WhatsApp em wa_dlr.
-    """
     try:
         raw_bytes = await request.body()
         raw_str = raw_bytes.decode("utf-8", "ignore")
@@ -1153,7 +1858,6 @@ async def zenvia_webhook(request: Request):
         except Exception:
             payload = None
 
-        # Normaliza em lista de eventos
         if isinstance(payload, dict):
             events = [payload]
         elif isinstance(payload, list):
@@ -1161,60 +1865,79 @@ async def zenvia_webhook(request: Request):
         else:
             events = []
 
-        # Atalho: ping manual
-        if len(events) == 1 and isinstance(events[0], dict) and events[0].get("ping") == "ok":
+        if (
+            len(events) == 1
+            and isinstance(events[0], dict)
+            and events[0].get("ping") == "ok"
+        ):
             msg_id = events[0].get("messageId") or f"ping-{secrets.token_hex(4)}"
             with db() as con:
-                con.execute("""
+                con.execute(
+                    """
                     INSERT INTO sms_dlr (message_id, to_number, status, code, description, raw_json, received_at)
                     VALUES (?,?,?,?,?,?,?)
-                """, (msg_id, "", "PING", "PING", "PING", raw_str, _now()))
+                """,
+                    (msg_id, "", "PING", "PING", "PING", raw_str, _now()),
+                )
             return JSONResponse({"ok": True})
 
-        # Persiste cada evento
         with db() as con:
             for ev in events:
                 if not isinstance(ev, dict):
                     continue
 
-                # message node (alguns eventos vêm aninhados)
                 msg_node = ev.get("message") or {}
 
-                # --- Message ID robusto ---
                 msg_id = (
-                    (ev.get("messageId") or ev.get("id") or "") or
-                    (msg_node.get("messageId") or msg_node.get("id") or "")
+                    (ev.get("messageId") or ev.get("id") or "")
+                    or (msg_node.get("messageId") or msg_node.get("id") or "")
                 )
                 msg_id = str(msg_id).strip()
 
-                # --- Canal robusto ---
-                channel = (
-                    (ev.get("channel") or ev.get("type") or "") or
-                    (msg_node.get("channel") or msg_node.get("type") or "") or
-                    (isinstance(ev.get("to"), dict) and ev.get("to", {}).get("type") or "")
-                )
-                channel = str(channel).strip().lower()
-
-                # --- TO robusto (dict/str + aliases) ---
                 def _extract_to(obj: dict) -> str:
                     to_raw = obj.get("to") or obj.get("destination") or obj.get("recipient")
                     if isinstance(to_raw, dict):
                         return str(
-                            to_raw.get("phoneNumber") or to_raw.get("id") or to_raw.get("number") or ""
+                            to_raw.get("phoneNumber")
+                            or to_raw.get("id")
+                            or to_raw.get("number")
+                            or ""
                         ).strip()
                     return str(to_raw or "").strip()
 
+                channel = (
+                    (ev.get("channel") or ev.get("type") or "")
+                    or (msg_node.get("channel") or msg_node.get("type") or "")
+                    or (
+                        isinstance(ev.get("to"), dict)
+                        and ev.get("to", {}).get("type")
+                        or ""
+                    )
+                )
+                channel = str(channel).strip().lower()
+
                 to_number = _extract_to(ev) or _extract_to(msg_node)
 
-                # --- STATUS robusto (dict ou string) ---
-                st = ev.get("status") or ev.get("messageStatus") or ev.get("event") or ev.get("state")
+                st = (
+                    ev.get("status")
+                    or ev.get("messageStatus")
+                    or ev.get("event")
+                    or ev.get("state")
+                )
                 code = description = status = ""
                 if isinstance(st, dict):
                     code = str(
-                        st.get("code") or st.get("status") or st.get("event") or st.get("state") or ""
+                        st.get("code")
+                        or st.get("status")
+                        or st.get("event")
+                        or st.get("state")
+                        or ""
                     ).strip()
                     description = str(
-                        st.get("description") or st.get("reason") or st.get("detail") or ""
+                        st.get("description")
+                        or st.get("reason")
+                        or st.get("detail")
+                        or ""
                     ).strip()
                     status = code or "UNKNOWN"
                 elif isinstance(st, str):
@@ -1222,39 +1945,39 @@ async def zenvia_webhook(request: Request):
                 else:
                     status = "UNKNOWN"
 
-                # Decide a tabela pelo canal
                 if channel == "whatsapp":
-                    con.execute("""
+                    con.execute(
+                        """
                         INSERT INTO wa_dlr (message_id, to_number, status, code, description, channel, raw_json, received_at)
                         VALUES (?,?,?,?,?,?,?,?)
-                    """, (msg_id, to_number, status, code, description, channel, raw_str, _now()))
+                    """,
+                        (
+                            msg_id,
+                            to_number,
+                            status,
+                            code,
+                            description,
+                            channel,
+                            raw_str,
+                            _now(),
+                        ),
+                    )
                 else:
-                    # default -> SMS
-                    con.execute("""
+                    con.execute(
+                        """
                         INSERT INTO sms_dlr (message_id, to_number, status, code, description, raw_json, received_at)
                         VALUES (?,?,?,?,?,?,?)
-                    """, (msg_id, to_number, status, code, description, raw_str, _now()))
+                    """,
+                        (msg_id, to_number, status, code, description, raw_str, _now()),
+                    )
 
         return JSONResponse({"ok": True})
     except Exception as e:
         logger.error("[ZENVIA WH][DB] %s", e)
-        # mantemos 200 para Zenvia não re-tentar indefinidamente
         return JSONResponse(status_code=200, content={"ok": True})
 
-
 # ---------------------------------------------------------
-# Endpoints de saúde
-# ---------------------------------------------------------
-@app.get("/ping")
-def ping():
-    return {"pong": True}
-
-@app.get("/api/health")
-def health():
-    return {"ok": True, "ts": _now()}
-
-# ---------------------------------------------------------
-# SOS — envia para contatos do usuário (se informado) ou listas do .env (legado)
+# Helpers: contatos / nome template
 # ---------------------------------------------------------
 def _contacts_for_user(uid: int) -> Dict[str, List[sqlite3.Row]]:
     with db() as con:
@@ -1267,36 +1990,64 @@ def _contacts_for_user(uid: int) -> Dict[str, List[sqlite3.Row]]:
         out[r["type"]].append(r)
     return out
 
+
 def _resolve_nome_for_template(user_id: Optional[int], payload: SosIn) -> Optional[str]:
-    # prioridade: env -> perfil -> payload.s1
     env_nome = (os.getenv("ZENVIA_WA_NOME") or "").strip()
     if env_nome:
         return env_nome
     if user_id:
         with db() as con:
-            r = con.execute("SELECT full_name FROM profiles WHERE user_id=?", (user_id,)).fetchone()
+            r = con.execute(
+                "SELECT full_name FROM profiles WHERE user_id=?", (user_id,),
+            ).fetchone()
         if r and (r["full_name"] or "").strip():
             return r["full_name"].strip()
     if payload.s1 and payload.s1.strip():
         return payload.s1.strip()
     return None
 
+# ---------------------------------------------------------
+# Endpoints de saúde
+# ---------------------------------------------------------
+@app.get("/ping")
+def ping():
+    return {"pong": True}
+
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "ts": _now()}
+
+# ---------------------------------------------------------
+# SOS principal
+# ---------------------------------------------------------
 @app.post("/api/sos")
 async def api_sos(payload: SosIn):
     lat, lon, acc = payload.lat, payload.lon, payload.acc
 
-    # Monta bloco de localização
+    # Live tracking para link de rastreio
+    nome_for_track = (payload.nome or payload.s1 or "").strip() or None
+    tracking_id: Optional[str] = None
+    tracking_url: Optional[str] = None
+    if _valid_coords(lat, lon):
+        res = _create_live_tracking_session(nome_for_track, lat, lon)
+        if res:
+            tracking_id, tracking_url = res
+
     loc_lines, maps_link = [], ""
     if _valid_coords(lat, lon):
         maps_link = _maps_url(float(lat), float(lon))
         acc_txt = f" (±{int(acc)}m)" if isinstance(acc, (int, float)) else ""
-        loc_lines.append(f"Localização: lat={float(lat):.5f} lon={float(lon):.5f}{acc_txt}")
+        loc_lines.append(
+            f"Localização: lat={float(lat):.5f} lon={float(lon):.5f}{acc_txt}"
+        )
         loc_lines.append(maps_link)
+        if tracking_url:
+            loc_lines.append(f"Rastreamento: {tracking_url}")
     else:
         loc_lines.append("Localização: não informada")
 
-    # E-mail
-    subject = "SOS – ANJO DA GUARDA"
+    subject = "SOS - ANJO DA GUARDA"
     body_lines = ["Alerta de emergência (ANJO DA GUARDA)", ""]
     if payload.text:
         body_lines.append(payload.text)
@@ -1304,16 +2055,31 @@ async def api_sos(payload: SosIn):
     body_lines.extend(loc_lines)
     body = "\n".join(body_lines)
 
-    # Telegram
-    tg_text = render_tg_sos_html(payload.text, maps_link)
-    reply_markup = {"inline_keyboard": [[{"text": "Abrir no Maps", "url": maps_link}]]} if maps_link else None
+    # Telegram: texto + botão com rastreamento (se existir)
+    tg_maps_part = maps_link
+    if tracking_url:
+        if maps_link:
+            tg_maps_part = f"{maps_link}\nRastreamento: {tracking_url}"
+        else:
+            tg_maps_part = f"Rastreamento: {tracking_url}"
 
-    # Descobre user_id (se veio user_email verificado)
+    tg_text = render_tg_sos_html(payload.text, tg_maps_part)
+
+    link_for_button = tracking_url or maps_link
+    reply_markup = (
+        {"inline_keyboard": [[{"text": "Abrir rastreamento", "url": link_for_button}]]}
+        if link_for_button
+        else None
+    )
+
+
     user_id = None
     if payload.user_email:
         with db() as con:
-            row = con.execute("SELECT id, email_verified FROM users WHERE email=?",
-                              (payload.user_email.strip().lower(),)).fetchone()
+            row = con.execute(
+                "SELECT id, email_verified FROM users WHERE email=?",
+                (payload.user_email.strip().lower(),),
+            ).fetchone()
             if row and row["email_verified"]:
                 user_id = row["id"]
 
@@ -1321,69 +2087,68 @@ async def api_sos(payload: SosIn):
     sms_results: List[Dict[str, Any]] = []
     wa_results: List[Dict[str, Any]] = []
 
-    # Nome para template (se existir)
     nome_tpl = _resolve_nome_for_template(user_id, payload)
 
     if user_id:
-        # Fan-out por usuário (contatos pessoais)
         contacts = _contacts_for_user(user_id)
 
-        # E-mail dos contatos
         if contacts["email"]:
             email_list = [c["value"] for c in contacts["email"]]
             r = send_email(subject, body, email_list)
             logger.info("[EMAIL] result=%s", r)
             sent_email = 1 if r.get("ok") else 0
 
-        # WhatsApp por contatos do usuário (transacional, 1-a-1)
         wa_numbers = [c["value"] for c in contacts["whatsapp"]]
         if wa_numbers:
-            use_simple_wa = os.getenv("ZENVIA_WA_SIMPLE", "false").lower() in ("1", "true", "yes", "on")
+            use_simple_wa = (
+                os.getenv("ZENVIA_WA_SIMPLE", "false").lower()
+                in ("1", "true", "yes", "on")
+            )
             template_id = (os.getenv("ZENVIA_WA_TEMPLATE_ID") or "").strip()
-            fields_mode = (os.getenv("ZENVIA_WA_FIELDS_MODE", "latlon") or "latlon").lower()  # "maps" ou "latlon"
-            nome_tpl = (os.getenv("ZENVIA_WA_NOME") or (payload.s1 or "")).strip()
+            fields_mode = (
+                os.getenv("ZENVIA_WA_FIELDS_MODE", "latlon") or "latlon"
+            ).lower()
+            nome_env = (os.getenv("ZENVIA_WA_NOME") or (payload.s1 or "")).strip()
 
             if use_simple_wa or not template_id:
-                # modo texto simples (fora da janela 24h pode rejeitar)
                 wa_text = f"SOS - {maps_link or ''}".strip()
                 tpl_fields = None
             else:
-                # modo template aprovado
-                wa_text = ""  # não usado em template
+                wa_text = ""
                 tpl_fields = {}
-                if nome_tpl:
-                    tpl_fields["nome"] = nome_tpl
+                if nome_env:
+                    tpl_fields["nome"] = nome_env
 
                 if fields_mode == "maps":
-                    # template com variáveis {{nome}} e {{maps_link}}
-                    if maps_link:
-                        tpl_fields["local_aproximado"] = _local_aproximado_fragment(float(lat), float(lon))
+                    if maps_link and _valid_coords(lat, lon):
+                        tpl_fields["local_aproximado"] = _local_aproximado_fragment(
+                            float(lat), float(lon)
+                        )
                 else:
-                    # template com variáveis {{nome}}, {{lat}} e {{lon}}
                     if lat is not None:
                         tpl_fields["lat"] = str(lat)
                     if lon is not None:
                         tpl_fields["lon"] = str(lon)
 
-        wa_user_results = send_wa_to_numbers(wa_numbers, wa_text, tpl_fields)
-        wa_results.extend(wa_user_results)
-        logger.info("[WA][USER] results=%s", wa_user_results)
-        sent_whatsapp = 1 if any(r.get("ok") for r in wa_user_results) else 0
+            wa_user_results = send_wa_to_numbers(wa_numbers, wa_text, tpl_fields)
+            wa_results.extend(wa_user_results)
+            logger.info("[WA][USER] results=%s", wa_user_results)
+            sent_whatsapp = 1 if any(r.get("ok") for r in wa_user_results) else 0
 
-
-        # (Opcional futuro) SMS por contatos do usuário
+        # SMS por contato do usuário — deixamos para fase futura
         if contacts["sms"]:
-            # TODO: implementar envio SMS por contato (mantido para fase seguinte)
             sent_sms = sent_sms or 0
 
-        # Telegram por contatos (ativados)
         if contacts["telegram"] and CFG.tg_enabled:
             with db() as con:
-                rows = con.execute("""
+                rows = con.execute(
+                    """
                     SELECT tc.chat_id FROM telegram_contacts tc
                     JOIN contacts c ON c.id = tc.contact_id
                     WHERE c.user_id=? AND c.type='telegram' AND c.status='active' AND tc.chat_id IS NOT NULL
-                """, (user_id,)).fetchall()
+                """,
+                    (user_id,),
+                ).fetchall()
             res_all = []
             any_ok = False
             for i, rr in enumerate(rows):
@@ -1398,56 +2163,62 @@ async def api_sos(payload: SosIn):
                     if CFG.tg_broadcast_throttle_ms and i < len(rows) - 1:
                         time.sleep(CFG.tg_broadcast_throttle_ms / 1000.0)
             sent_telegram = 1 if any_ok else 0
-        else:
-            sent_telegram = 0
 
     else:
-        # LEGADO: usa as listas do .env
+        # LEGADO (.env)
         r = send_email(subject, body, None)
         sent_email = 1 if r.get("ok") else 0
 
-        # SMS (Zenvia) – legado via .env
         try:
             token_ok = bool(os.getenv("ZENVIA_API_TOKEN"))
             to_raw = os.getenv("ZENVIA_SMS_TO_LIST", "")
             if token_ok and to_raw:
-                # helpers locais
-                _get = (lambda o, k, d="": (o.get(k, d) if isinstance(o, dict) else getattr(o, k, d)))
+                _get = (
+                    lambda o, k, d="": (o.get(k, d) if isinstance(o, dict) else getattr(o, k, d))
+                )
+
                 def _sanitize(s: str) -> str:
-                    # evita caracteres que já causaram rejeição em alguns provedores
-                    return (s or "") \
-                        .replace("–", "-").replace("—", "-") \
-                        .replace("…", "...") \
-                        .replace("’", "'") \
-                        .replace("“", '"').replace("”", '"')
+                    return (
+                        (s or "")
+                        .replace("–", "-")
+                        .replace("—", "-")
+                        .replace("…", "...")
+                        .replace("’", "'")
+                        .replace("“", '"')
+                        .replace("”", '"')
+                    )
 
                 nome = (_get(payload, "nome", "") or os.getenv("ZENVIA_WA_NOME") or "").strip()
                 text_line = _get(payload, "text", "").strip()
 
-                # garante inclusão do link quando houver coordenadas válidas
                 has_coords = _valid_coords(lat, lon) and bool(maps_link)
 
-                use_simple = os.getenv("ZENVIA_SMS_SIMPLE", "false").lower() in ("1", "true", "yes", "on")
+                use_simple = (
+                    os.getenv("ZENVIA_SMS_SIMPLE", "false").lower()
+                    in ("1", "true", "yes", "on")
+                )
                 if use_simple:
-                    # simples: tenta sempre incluir o link; se não houver coords, usa o texto
                     sms_text = f"SOS - {(maps_link if has_coords else (text_line or 'SOS pessoal'))}".strip()
+                    if tracking_url:
+                        sms_text = f"{sms_text}\nRastreamento: {tracking_url}"
                 else:
-                    # Montagem padrão (sem acentos “exóticos” e com fallback quando não há coords)
                     titulo = f"ALERTA de {nome}" if nome else "ALERTA"
                     linhas = [
                         titulo,
                         f"Situacao: {text_line or 'SOS pessoal'}",
-                        (f"Localizacao (mapa): {maps_link}" if has_coords else "Localizacao: nao informada"),
+                        (
+                            f"Localizacao (mapa): {maps_link}"
+                            if has_coords
+                            else "Localizacao: nao informada"
+                        ),
                     ]
+                    if tracking_url:
+                        linhas.append(f"Rastreamento: {tracking_url}")
                     sms_text = "\n".join(linhas).strip()
 
                 sms_text = _sanitize(sms_text)
                 logger.info("[SMS] body=%s", sms_text)
 
-                # >>> a chamada de envio permanece a mesma, logo abaixo deste bloco <<<
-
-
-                # Override por .env (agora aceita {nome})
                 override = (os.getenv("ZENVIA_SMS_TEST") or "").strip()
                 if override:
                     try:
@@ -1460,60 +2231,93 @@ async def api_sos(payload: SosIn):
                             NOME=nome,
                         )
                     except Exception as e:
-                        logger.warning("[SMS] override.format falhou: %s; usando fallback literal", e)
-                        sms_text = (override
-                                    .replace("{maps_link}", maps_link or "")
-                                    .replace("{MAPS_LINK}", maps_link or "")
-                                    .replace("{text}", text_line)
-                                    .replace("{TEXT}", text_line)
-                                    .replace("{nome}", nome)
-                                    .replace("{NOME}", nome))
+                        logger.warning(
+                            "[SMS] override.format falhou: %s; usando fallback literal", e
+                        )
+                        sms_text = (
+                            override.replace("{maps_link}", maps_link or "")
+                            .replace("{MAPS_LINK}", maps_link or "")
+                            .replace("{text}", text_line)
+                            .replace("{TEXT}", text_line)
+                            .replace("{nome}", nome)
+                            .replace("{NOME}", nome)
+                        )
 
-                sms_text = _sanitize(sms_text.replace("\\n", "\n").replace("\\r\\n", "\n"))[:700]
+                sms_text = _sanitize(
+                    sms_text.replace("\\n", "\n").replace("\\r\\n", "\n")
+                )[:700]
 
                 logger.info("[SMS] sending... from=%s to_list=%s", _resolve_sms_sender(), to_raw)
                 sms_results = send_sms_zenvia_list(sms_text)
                 sent_sms = 1 if any(r.get("ok") for r in sms_results) else 0
                 logger.info("[SMS] results=%s", sms_results)
             else:
-                logger.info("[SMS] skipped: token_ok=%s to_list_present=%s", token_ok, bool(to_raw))
+                logger.info(
+                    "[SMS] skipped: token_ok=%s to_list_present=%s", token_ok, bool(to_raw)
+                )
         except Exception as e:
             logger.error("[SMS] erro ao enviar: %s", e)
 
-
-        # WhatsApp (Zenvia) – legado via .env
         try:
-            wa_enabled = (os.getenv("ZENVIA_WA_ENABLED", os.getenv("ZENVIA_WHATSAPP_ENABLED", "false")).lower()
-                          in ("1", "true", "yes", "on"))
-            from_wa = (os.getenv("ZENVIA_WA_FROM") or os.getenv("ZENVIA_WHATSAPP_FROM") or "").strip()
-            to_wa_raw = (os.getenv("ZENVIA_WA_TO_LIST") or os.getenv("ZENVIA_WHATSAPP_TO_LIST") or "").strip()
+            wa_enabled = (
+                os.getenv(
+                    "ZENVIA_WA_ENABLED",
+                    os.getenv("ZENVIA_WHATSAPP_ENABLED", "false"),
+                ).lower()
+                in ("1", "true", "yes", "on")
+            )
+            from_wa = (
+                os.getenv("ZENVIA_WA_FROM") or os.getenv("ZENVIA_WHATSAPP_FROM") or ""
+            ).strip()
+            to_wa_raw = (
+                os.getenv("ZENVIA_WA_TO_LIST")
+                or os.getenv("ZENVIA_WHATSAPP_TO_LIST")
+                or ""
+            ).strip()
             template_id = (os.getenv("ZENVIA_WA_TEMPLATE_ID") or "").strip()
 
             if wa_enabled and from_wa and to_wa_raw:
-                use_simple_wa = os.getenv("ZENVIA_WA_SIMPLE", "false").lower() in ("1","true","yes","on")
+                use_simple_wa = (
+                    os.getenv("ZENVIA_WA_SIMPLE", "false").lower()
+                    in ("1", "true", "yes", "on")
+                )
 
                 if use_simple_wa or not template_id:
-                    wa_text = f"🚨 SOS – ANJO DA GUARDA\n{(payload.text or '').strip()}\n{maps_link or ''}".strip()
+                    wa_text = (
+                        f"🚨 ALERTA de {(nome_tpl or 'contato')}\n"
+                        f"Situação: {(payload.text or '').strip()}\n"
+                        f"Localização (mapa): {maps_link or ''}"
+                    ).strip()
                     tpl_fields = None
                 else:
                     tpl_fields = {}
                     if _valid_coords(lat, lon) and maps_link:
-                        tpl_fields["local_aproximado"] = _local_aproximado_fragment(float(lat), float(lon))
+                        tpl_fields["local_aproximado"] = _local_aproximado_fragment(
+                            float(lat), float(lon)
+                        )
                     if nome_tpl:
                         tpl_fields["nome"] = nome_tpl
                     wa_text = ""
 
-                logger.info("[WA] sending... from=%s to_list=%s mode=%s",
-                            from_wa, to_wa_raw,
-                            "template" if (not use_simple_wa and template_id) else "text")
-                wa_fallback_text = ("🚨 SOS – ANJO DA GUARDA" + (f"\n{maps_link}" if maps_link else "")).strip()
-
+                logger.info(
+                    "[WA] sending... from=%s to_list=%s mode=%s",
+                    from_wa,
+                    to_wa_raw,
+                    "template" if (not use_simple_wa and template_id) else "text",
+                )
+                wa_fallback_text = (
+                    "🚨 ALERTA de "
+                    + (nome_tpl or "contato")
+                    + (f"\nLocalização (mapa): {maps_link}" if maps_link else "")
+                ).strip()
 
                 if not use_simple_wa and template_id:
                     try:
                         wa_results = send_wa_zenvia_list_template(tpl_fields)
                     except Exception as e_tpl:
-                        logger.warning("[WA] template falhou (%s); usando texto", e_tpl)
+                        logger.warning(
+                            "[WA] template falhou (%s); usando texto", e_tpl
+                        )
                         wa_results = send_wa_zenvia_list(wa_fallback_text)
                 else:
                     wa_results = send_wa_zenvia_list(wa_fallback_text)
@@ -1521,12 +2325,15 @@ async def api_sos(payload: SosIn):
                 sent_whatsapp = 1 if any(r.get("ok") for r in wa_results) else 0
                 logger.info("[WA] results=%s", wa_results)
             else:
-                logger.info("[WA] skipped: enabled=%s from=%s to_list_present=%s",
-                            wa_enabled, bool(from_wa), bool(to_wa_raw))
+                logger.info(
+                    "[WA] skipped: enabled=%s from=%s to_list_present=%s",
+                    wa_enabled,
+                    bool(from_wa),
+                    bool(to_wa_raw),
+                )
         except Exception as e:
             logger.error("[WA] erro ao enviar: %s", e)
 
-        # Telegram (legado por .env)
         any_ok = False
         if CFG.tg_enabled and (CFG.tg_chat_ids or CFG.tg_chat_id_legacy):
             chat_ids = _parse_chat_ids_from_env()
@@ -1542,12 +2349,22 @@ async def api_sos(payload: SosIn):
                         time.sleep(CFG.tg_broadcast_throttle_ms / 1000.0)
         sent_telegram = 1 if any_ok else 0
 
-    # Auditoria
     with db() as con:
-        con.execute("""
+        con.execute(
+            """
             INSERT INTO sos_audit(user_id, payload_json, sent_email, sent_sms, sent_whatsapp, sent_telegram, created_at)
             VALUES(?,?,?,?,?,?,?)
-        """, (user_id, json.dumps(payload.dict()), sent_email, sent_sms, sent_whatsapp, sent_telegram, _now()))
+        """,
+            (
+                user_id,
+                json.dumps(payload.dict()),
+                sent_email,
+                sent_sms,
+                sent_whatsapp,
+                sent_telegram,
+                _now(),
+            ),
+        )
 
     ok = any([sent_email, sent_sms, sent_whatsapp, sent_telegram])
     return JSONResponse(
@@ -1561,141 +2378,48 @@ async def api_sos(payload: SosIn):
                 "telegram": sent_telegram,
                 "sms_results": sms_results,
                 "wa_results": wa_results,
-            }
-        }
+                "tracking_id": tracking_id,
+                "tracking_url": tracking_url,
+            },
+        },
     )
 
 # ---------------------------------------------------------
-# Live Location (start / update / stop)
-# ---------------------------------------------------------
-def _live_destinations_for(user_email: Optional[str]):
-    user_id = None
-    chat_ids: List[str] = []
-    if user_email:
-        with db() as con:
-            row = con.execute("SELECT id, email_verified FROM users WHERE email=?",
-                              (user_email.strip().lower(),)).fetchone()
-            if row and row["email_verified"]:
-                user_id = row["id"]
-                rows = con.execute("""
-                    SELECT tc.chat_id FROM telegram_contacts tc
-                    JOIN contacts c ON c.id = tc.contact_id
-                    WHERE c.user_id=? AND c.type='telegram' AND c.status='active' AND tc.chat_id IS NOT NULL
-                """, (user_id,)).fetchall()
-                chat_ids = [r["chat_id"] for r in rows]
-    if not chat_ids:
-        chat_ids = _parse_chat_ids_from_env()
-    return user_id, chat_ids
-
-@app.post("/api/live/start")
-def live_start(payload: LiveStartIn):
-    if not CFG.tg_enabled:
-        return JSONResponse(status_code=400, content={"ok": False, "reason": "TELEGRAM_DISABLED"})
-    user_id, chat_ids = _live_destinations_for(payload.user_email)
-    if not chat_ids:
-        return JSONResponse(status_code=400, content={"ok": False, "reason": "NO_CHAT_IDS"})
-
-    live_id = secrets.token_urlsafe(10)
-    expires = (datetime.utcnow() + timedelta(seconds=min(max(payload.duration, 60), 86400))).isoformat()
-
-    results = []
-    any_ok = False
-    for cid in chat_ids:
-        r = _send_telegram_live_start_once(cid, float(payload.lat), float(payload.lon), payload.duration)
-        results.append(r)
-        mid = r.get("message_id")
-
-        if r.get("ok") and mid:
-            try:
-                with db() as con:
-                    con.execute("""
-                        INSERT INTO live_sessions
-                          (user_id, session_token, chat_id, message_id, active, started_at, expires_at)
-                        VALUES (?,?,?,?,1,?,?)
-                    """, (user_id, live_id, str(cid), int(mid), _now(), expires))
-                logger.info("[DB] LIVE SAVED token=%s chat_id=%s msg_id=%s expires=%s",
-                            live_id, cid, mid, expires)
-                any_ok = True
-            except Exception as e:
-                logger.error("[DB] LIVE INSERT ERROR token=%s chat_id=%s msg_id=%s err=%s",
-                             live_id, cid, mid, e)
-                results.append({"ok": False, "reason": f"DB_ERROR: {e}", "chat_id": cid})
-        else:
-            logger.warning("[DB] LIVE NOT SAVED token=%s chat_id=%s ok=%s msg_id=%r reason=%s",
-                           live_id, cid, r.get("ok"), mid, r.get("reason") or r.get("response"))
-
-    return JSONResponse(status_code=200 if any_ok else 500,
-                        content={"ok": any_ok, "live_id": live_id, "results": results})
-
-@app.post("/api/live/update")
-def live_update(payload: LiveUpdateIn):
-    with db() as con:
-        rows = con.execute("""
-            SELECT chat_id, message_id FROM live_sessions
-            WHERE session_token=? AND active=1
-        """, (payload.live_id,)).fetchall()
-    if not rows:
-        return JSONResponse(status_code=404, content={"ok": False, "reason": "LIVE_NOT_FOUND_OR_INACTIVE"})
-
-    results = []
-    any_ok = False
-    for r in rows:
-        res = _edit_telegram_live_once(str(r["chat_id"]), int(r["message_id"]), float(payload.lat), float(payload.lon))
-        results.append(res)
-        any_ok = any_ok or res.get("ok", False)
-    return {"ok": any_ok, "results": results}
-
-@app.post("/api/live/stop")
-def live_stop(payload: LiveStopIn):
-    with db() as con:
-        rows = con.execute("""
-            SELECT chat_id, message_id FROM live_sessions
-            WHERE session_token=? AND active=1
-        """, (payload.live_id,)).fetchall()
-    if not rows:
-        return JSONResponse(status_code=404, content={"ok": False, "reason": "LIVE_NOT_FOUND_OR_INACTIVE"})
-
-    results = []
-    any_ok = False
-    for r in rows:
-        res = _stop_telegram_live_once(str(r["chat_id"]), int(r["message_id"]))
-        results.append(res)
-        any_ok = any_ok or res.get("ok", False)
-
-    with db() as con:
-        con.execute("UPDATE live_sessions SET active=0 WHERE session_token=?", (payload.live_id,))
-    return {"ok": any_ok, "results": results}
-
-# ---------------------------------------------------------
-# Debug: últimos DLRs de SMS e WA
+# Debug DLR SMS/WA
 # ---------------------------------------------------------
 @app.get("/debug/sms_dlr_recent")
 def debug_sms_dlr_recent(limit: int = 20):
     with db() as con:
-        rows = con.execute("""
+        rows = con.execute(
+            """
             SELECT id, message_id, to_number, status, code, description, received_at
             FROM sms_dlr
             ORDER BY id DESC
             LIMIT ?
-        """, (limit,)).fetchall()
+        """,
+            (limit,),
+        ).fetchall()
     return {"rows": [dict(r) for r in rows]}
+
 
 @app.get("/debug/wa_dlr_recent")
 def debug_wa_dlr_recent(limit: int = 20):
     with db() as con:
-        rows = con.execute("""
+        rows = con.execute(
+            """
             SELECT id, message_id, to_number, status, code, description, channel, received_at
             FROM wa_dlr
             ORDER BY id DESC
             LIMIT ?
-        """, (limit,)).fetchall()
+        """,
+            (limit,),
+        ).fetchall()
     return {"rows": [dict(r) for r in rows]}
 
 # ---------------------------------------------------------
-# Estáticos (deixe no fim)
+# Estáticos
 # ---------------------------------------------------------
 WEB_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "web"))
 if not os.path.isdir(WEB_DIR):
     os.makedirs(WEB_DIR, exist_ok=True)
 app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")
-
