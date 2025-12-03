@@ -20,7 +20,7 @@ android {
 
         // Campos padrão (vazios) para TODAS as builds
         buildConfigField("String", "TELEGRAM_BOT_TOKEN", "\"\"")
-        buildConfigField("String", "TELEGRAM_CHAT_ID", "\"123456789,987654321\"")
+        buildConfigField("String", "TELEGRAM_CHAT_ID", "\"\"")
 
         buildConfigField("String", "ZENVIA_TOKEN", "\"\"")
         buildConfigField("String", "ZENVIA_SMS_FROM", "\"\"")
@@ -28,28 +28,41 @@ android {
 
         buildConfigField("String", "SENDGRID_API_KEY", "\"\"")
         buildConfigField("String", "SENDGRID_FROM", "\"\"")
+
+        // URL do backend FastAPI (emulador falando com o PC)
+        buildConfigField(
+            "String",
+            "BACKEND_BASE_URL",
+            "\"http://10.0.2.2:8000\""
+        )
     }
 
     // Necessário para expor BuildConfig.*
-    buildFeatures { buildConfig = true }
+    buildFeatures {
+        buildConfig = true
+    }
 
-    // Use Java 17 (recomendado pelas versões atuais do Flutter/AGP)
+    // Java 17
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
 
     // Assinatura: usa o debug para testes
     signingConfigs {
-        getByName("debug")
+        getByName("debug") {
+            // default debug keystore
+        }
     }
 
     buildTypes {
         // Segredos para testes locais (debug)
         debug {
             // --- TELEGRAM ---
-            // BOT TOKEN fica no BuildConfig; o destino (chat_id/@canal) vem da UI
             buildConfigField(
                 "String",
                 "TELEGRAM_BOT_TOKEN",
@@ -62,7 +75,6 @@ android {
             )
 
             // --- ZENVIA (SMS/WhatsApp) ---
-            // Token e remetentes (FROM) são nossos e não aparecem na UI
             buildConfigField(
                 "String",
                 "ZENVIA_TOKEN",
@@ -71,18 +83,15 @@ android {
             buildConfigField(
                 "String",
                 "ZENVIA_SMS_FROM",
-                "\"glaucusmotta\""        // o MESMO from que você usa hoje no Zenvia
+                "\"glaucusmotta\""
             )
             buildConfigField(
                 "String",
                 "ZENVIA_WA_FROM",
-                "\"5511961704582\""   // o MESMO from que você usa hoje no Zenvia
+                "\"5511961704582\""
             )
 
             // --- SENDGRID (E-mail) ---
-            // IMPORTANTE:
-            //  - SENDGRID_API_KEY: a CHAVE da API do SendGrid (Settings > API Keys)
-            //  - SENDGRID_FROM: e-mail remetente verificado no SendGrid
             buildConfigField(
                 "String",
                 "SENDGRID_API_KEY",
@@ -93,10 +102,17 @@ android {
                 "SENDGRID_FROM",
                 "\"alerta@3g-brasil.com\""
             )
+
+            // Backend também no debug
+            buildConfigField(
+                "String",
+                "BACKEND_BASE_URL",
+                "\"http://10.0.2.2:8000\""
+            )
         }
 
         release {
-            // (para testes) assina com o debug; em produção use seu keystore
+            // (para testes) assina com o debug; em produção usar keystore própria
             signingConfig = signingConfigs.getByName("debug")
             isMinifyEnabled = false
             isShrinkResources = false

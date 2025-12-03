@@ -1,11 +1,20 @@
 package com.example.anjo_da_guarda_app
 
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
+import androidx.core.content.ContextCompat
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.Priority
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
@@ -21,6 +30,18 @@ class SosDispatcher(private val ctx: Context) {
         .build()
 
     private val json = "application/json; charset=utf-8".toMediaType()
+
+    // ---------------------------------------------------------
+    // Backend de Live Tracking (FastAPI)
+    // ---------------------------------------------------------
+    private val liveTrackBaseUrl = "https://anjo-track.3g-brasil.com"
+    private val liveTrackEnabled = true
+
+    // Controle de loop de live tracking (Android nativo)
+    private var liveTrackCallback: LocationCallback? = null
+    private var liveTrackStopAtMs: Long = 0L
+    private val liveTrackIntervalMs: Long = 15_000L            // 15s entre updates
+    private val liveTrackMaxDurationMs: Long = 30 * 60 * 1000L // 30 minutos
 
     // Deixa o número só com dígitos (remove +, (), espaço, traço etc.)
     private fun normalizeMsisdn(raw: String): String =
@@ -45,7 +66,6 @@ class SosDispatcher(private val ctx: Context) {
     }
 
     // Lê o "nome completo" salvo pelo Flutter nas SharedPreferences
-    // (arquivo padrão do plugin: "FlutterSharedPreferences", chaves começam com "flutter.")
     private fun getNomeCompletoFromPrefs(): String? {
         return try {
             val prefs = ctx.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
@@ -71,16 +91,238 @@ class SosDispatcher(private val ctx: Context) {
 
     private fun logResp(tag: String, resp: Response) {
         val code = resp.code
-        val body = try { resp.body?.string() ?: "" } catch (_: Throwable) { "<no-body>" }
+        val body = try {
+            resp.body?.string() ?: ""
+        } catch (_: Throwable) {
+            "<no-body>"
+        }
         Log.d(tag, "HTTP $code :: $body")
     }
 
+    // ---------------------------------------------------------
+    // Live Tracking – /api/live-track/start
+    // ---------------------------------------------------------
+    private fun startLiveTrack(text: String, lat: Double?, lon: Double?): String? {
+        if (!liveTrackEnabled) return null
+        if (liveTrackBaseUrl.isBlank()) {
+            Log.d("LIVE_TRACK", "skip start: baseUrl vazio (nao configurado)")
+            return null
+        }
+        if (lat == null || lon == null) {
+            Log.d("LIVE_TRACK", "skip start: sem coordenadas")
+            return null
+        }
+
+        val base = liveTrackBaseUrl.trimEnd('/')
+        val url = "$base/api/live-track/start"
+
+        val nome = getNomeCompletoFromPrefs() ?: "Contato"
+
+        return try {
+            val bodyJson = JSONObject()
+                .put("nome", nome)
+                .put("text", text)
+                .put("lat", lat)
+                .put("lon", lon)
+                .put("origem", "app_android")
+
+            val reqBody = bodyJson.toString().toRequestBody(json)
+
+            val client = http.newBuilder()
+                .connectTimeout(3, TimeUnit.SECONDS)
+                .readTimeout(5, TimeUnit.SECONDS)
+                .build()
+
+            client.newCall(
+                Request.Builder()
+                    .url(url)
+                    .post(reqBody)
+                    .build()
+            ).execute().use { resp ->
+                val rawBody = resp.body?.string() ?: ""
+                Log.d("LIVE_TRACK", "start HTTP ${resp.code} :: $rawBody")
+
+                if (!resp.isSuccessful) return null
+
+                val obj = JSONObject(rawBody)
+                val ok = obj.optBoolean("ok", false)
+                if (!ok) return null
+
+                val sessionId = obj.optString("session_id", "").trim()
+                if (sessionId.isNotEmpty()) {
+                    try {
+                        val prefs =
+                            ctx.getSharedPreferences("ANJO_LIVE_TRACK", Context.MODE_PRIVATE)
+                        prefs.edit().putString("session_id", sessionId).apply()
+                        Log.d("LIVE_TRACK", "session_id salvo: $sessionId")
+                    } catch (t: Throwable) {
+                        Log.e("LIVE_TRACK", "erro ao salvar session_id", t)
+                    }
+                }
+
+                obj.optString("tracking_url").takeIf { it.isNotBlank() }
+            }
+        } catch (t: Throwable) {
+            Log.e("LIVE_TRACK", "erro startLiveTrack", t)
+            null
+        }
+    }
+
+    // ---------------------------------------------------------
+    // Live Tracking – /api/live-track/update
+    // ---------------------------------------------------------
+    private fun updateLiveTrackInternal(lat: Double?, lon: Double?) {
+        if (!liveTrackEnabled) return
+        if (liveTrackBaseUrl.isBlank()) {
+            Log.d("LIVE_TRACK", "skip update: baseUrl vazio")
+            return
+        }
+        if (lat == null || lon == null) {
+            Log.d("LIVE_TRACK", "skip update: sem coordenadas")
+            return
+        }
+
+        val prefs = ctx.getSharedPreferences("ANJO_LIVE_TRACK", Context.MODE_PRIVATE)
+        val sessionId = prefs.getString("session_id", null)?.trim()
+        if (sessionId.isNullOrEmpty()) {
+            Log.d("LIVE_TRACK", "skip update: session_id vazio")
+            return
+        }
+
+        val base = liveTrackBaseUrl.trimEnd('/')
+        val url = "$base/api/live-track/update"
+
+        try {
+            val bodyJson = JSONObject()
+                .put("session_id", sessionId)
+                .put("lat", lat)
+                .put("lon", lon)
+
+            val reqBody = bodyJson.toString().toRequestBody(json)
+
+            val client = http.newBuilder()
+                .connectTimeout(3, TimeUnit.SECONDS)
+                .readTimeout(5, TimeUnit.SECONDS)
+                .build()
+
+            client.newCall(
+                Request.Builder()
+                    .url(url)
+                    .post(reqBody)
+                    .build()
+            ).execute().use { resp ->
+                val rawBody = resp.body?.string()?.take(200) ?: ""
+                Log.d("LIVE_TRACK", "update HTTP ${resp.code} :: $rawBody")
+            }
+        } catch (t: Throwable) {
+            Log.e("LIVE_TRACK", "erro updateLiveTrack", t)
+        }
+    }
+
+    // Método público chamado pelo Flutter (via NativeSos), se quiser:
+    fun liveTrackUpdate(lat: Double?, lon: Double?) {
+        thread {
+            updateLiveTrackInternal(lat, lon)
+        }
+    }
+
+    // ---------- Permissão de localização (para o loop interno) ----------
+    private fun hasLocationPermission(): Boolean {
+        val fine = ContextCompat.checkSelfPermission(
+            ctx,
+            android.Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        val coarse = ContextCompat.checkSelfPermission(
+            ctx,
+            android.Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        return fine || coarse
+    }
+
+    // ---------- Loop interno de live tracking (requestLocationUpdates) ----------
+    private fun startLiveTrackLoop() {
+        if (!liveTrackEnabled) {
+            Log.d("LIVE_TRACK", "loop nao iniciado: liveTrackEnabled=false")
+            return
+        }
+        if (liveTrackBaseUrl.isBlank()) {
+            Log.d("LIVE_TRACK", "loop nao iniciado: baseUrl vazio")
+            return
+        }
+        if (!hasLocationPermission()) {
+            Log.w("LIVE_TRACK", "loop nao iniciado: sem permissao de localizacao")
+            return
+        }
+        // Evita criar 2 loops em paralelo
+        if (liveTrackCallback != null) {
+            Log.d("LIVE_TRACK", "loop ja em execucao, nao recriando")
+            return
+        }
+
+        val fused = LocationServices.getFusedLocationProviderClient(ctx)
+
+        liveTrackStopAtMs = SystemClock.elapsedRealtime() + liveTrackMaxDurationMs
+
+        val request = LocationRequest.Builder(
+            Priority.PRIORITY_BALANCED_POWER_ACCURACY,
+            liveTrackIntervalMs
+        )
+            .setMinUpdateIntervalMillis(liveTrackIntervalMs)
+            .setMaxUpdateDelayMillis(liveTrackIntervalMs * 2)
+            .build()
+
+        liveTrackCallback = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                val now = SystemClock.elapsedRealtime()
+                if (now > liveTrackStopAtMs) {
+                    Log.d("LIVE_TRACK", "loop encerrado por timeout (30min)")
+                    fused.removeLocationUpdates(this)
+                    liveTrackCallback = null
+                    return
+                }
+
+                val loc = result.lastLocation
+                if (loc != null) {
+                    Log.d(
+                        "LIVE_TRACK",
+                        "loop update lat=${loc.latitude} lon=${loc.longitude}"
+                    )
+                    thread {
+                        runCatching {
+                            updateLiveTrackInternal(loc.latitude, loc.longitude)
+                        }.onFailure { e ->
+                            Log.e("LIVE_TRACK", "erro updateLiveTrack (loop)", e)
+                        }
+                    }
+                } else {
+                    Log.d("LIVE_TRACK", "loop sem lastLocation (null)")
+                }
+            }
+        }
+
+        fused.requestLocationUpdates(
+            request,
+            liveTrackCallback!!,
+            Looper.getMainLooper()
+        )
+
+        Log.d("LIVE_TRACK", "loop iniciado (intervalo=${liveTrackIntervalMs}ms)")
+    }
+
+    fun stopLiveTrackLoop() {
+        liveTrackCallback?.let { cb ->
+            val fused = LocationServices.getFusedLocationProviderClient(ctx)
+            fused.removeLocationUpdates(cb)
+        }
+        liveTrackCallback = null
+        liveTrackStopAtMs = 0L
+        Log.d("LIVE_TRACK", "loop parado manualmente")
+    }
+
     /**
-     * Envia para os canais usando segredos do BuildConfig e destinatários vindos da UI:
-     *  - tgTarget: chat_id numérico ou @canal/@grupo/@username (precisa conversa iniciada p/ PF)
-     *  - smsTo/waTo/emailTo: listas de destinatários (podem estar vazias)
-     *
-     * OBS: WhatsApp SEMPRE via TEMPLATE Zenvia/Meta (nada de texto livre).
+     * Envia para os canais usando segredos do BuildConfig e destinatários vindos da UI.
      */
     fun sendAll(
         text: String,
@@ -90,44 +332,64 @@ class SosDispatcher(private val ctx: Context) {
         waTo: List<String>,
         emailTo: List<String>
     ) {
-        val link = mapsLink(lat, lon)
-        val fullText = if (link != null) "$text\nLocalização (mapa): $link" else text
-
-        Log.d(
-            "ANJO_SOS",
-            "dispatch -> smsTo=${smsTo.size} waTo=${waTo.size} emailTo=${emailTo.size} " +
-                    "lat=$lat lon=$lon"
-        )
-
-        // TELEGRAM
+        // Tudo em segundo plano para não violar StrictMode (NetworkOnMainThread)
         thread {
-            runCatching { sendTelegram(fullText, tgTarget, lat, lon) }
-                .onFailure { Log.e("TG", "falha TG", it) }
-        }
+            // 1) Tenta iniciar live tracking e pegar o tracking_url
+            val trackingLink = startLiveTrack(text, lat, lon)
 
-        // SMS (Zenvia)
-        thread {
-            runCatching { sendZenviaSms(fullText, smsTo) }
-                .onFailure { Log.e("ZENVIA_SMS", "falha SMS", it) }
-        }
+            // 1.1) Se conseguiu criar sessão, inicia o loop nativo de updates
+            if (trackingLink != null) {
+                startLiveTrackLoop()
+            }
 
-        // WHATSAPP (Zenvia – usando TEMPLATE aprovado)
-        thread {
-            runCatching { sendZenviaWhats(fullText, waTo, lat, lon) }
-                .onFailure { Log.e("ZENVIA_WA", "falha WA geral", it) }
-        }
+            // 2) Se não vier tracking_url, cai no link tradicional do Google Maps
+            val link = trackingLink ?: mapsLink(lat, lon)
 
-        // E-MAIL (SendGrid)
-        thread {
-            runCatching { sendEmailSendGrid(fullText, emailTo) }
-                .onFailure { Log.e("MAIL", "falha MAIL", it) }
+            val fullText = if (link != null) {
+                "$text\nLocalização (mapa): $link"
+            } else {
+                text
+            }
+
+            Log.d(
+                "ANJO_SOS",
+                "dispatch -> smsTo=${smsTo.size} waTo=${waTo.size} emailTo=${emailTo.size} " +
+                        "lat=$lat lon=$lon trackingLink=$trackingLink"
+            )
+
+            // TELEGRAM
+            thread {
+                runCatching { sendTelegram(fullText, tgTarget, lat, lon) }
+                    .onFailure { Log.e("TG", "falha TG", it) }
+            }
+
+            // SMS (Zenvia)
+            thread {
+                runCatching { sendZenviaSms(fullText, smsTo) }
+                    .onFailure { Log.e("ZENVIA_SMS", "falha SMS", it) }
+            }
+
+            // WHATSAPP (Zenvia – usando TEMPLATE aprovado)
+            thread {
+                runCatching { sendZenviaWhats(fullText, waTo, link) }
+                    .onFailure { Log.e("ZENVIA_WA", "falha WA geral", it) }
+            }
+
+            // E-MAIL (SendGrid) - TEMPORARIAMENTE DESLIGADO (para não gerar custo)
+            // thread {
+            //     runCatching { sendEmailSendGrid(fullText, emailTo) }
+            //         .onFailure { Log.e("MAIL", "falha MAIL", it) }
+            // }
         }
     }
 
     // ---------------- Telegram ----------------
     private fun sendTelegram(msg: String, target: String?, lat: Double?, lon: Double?) {
         val token = BuildConfig.TELEGRAM_BOT_TOKEN
-        if (token.isBlank()) { Log.d("TG", "skip: TELEGRAM_BOT_TOKEN vazio"); return }
+        if (token.isBlank()) {
+            Log.d("TG", "skip: TELEGRAM_BOT_TOKEN vazio")
+            return
+        }
         val chatId = ((target ?: "").trim().ifEmpty { BuildConfig.TELEGRAM_CHAT_ID })
         if (chatId.isBlank()) {
             Log.d("TG", "skip: chat_id vazio/placeholder")
@@ -164,8 +426,11 @@ class SosDispatcher(private val ctx: Context) {
     // ---------------- Zenvia SMS (com logs) ----------------
     private fun sendZenviaSms(msg: String, list: List<String>) {
         val token = BuildConfig.ZENVIA_TOKEN
-        val from  = BuildConfig.ZENVIA_SMS_FROM
-        Log.d("ZENVIA_SMS", "start to=${list.size} tokenBlank=${token.isBlank()} fromBlank=${from.isBlank()}")
+        val from = BuildConfig.ZENVIA_SMS_FROM
+        Log.d(
+            "ZENVIA_SMS",
+            "start to=${list.size} tokenBlank=${token.isBlank()} fromBlank=${from.isBlank()}"
+        )
         if (token.isBlank() || from.isBlank()) {
             Log.w("ZENVIA_SMS", "skip: missing token/from")
             return
@@ -177,7 +442,7 @@ class SosDispatcher(private val ctx: Context) {
 
         val url = "https://api.zenvia.com/v2/channels/sms/messages"
 
-        // Ajusta "ALERTA de Contato" -> "ALERTA de {Nome Completo}" usando o cadastro do usuário
+        // Ajusta "ALERTA de Contato" -> "ALERTA de {Nome Completo}"
         val nomeCompleto = getNomeCompletoFromPrefs()
         val adjustedMsg = if (!nomeCompleto.isNullOrBlank()) {
             val pattern = Regex("ALERTA de\\s+Contato", RegexOption.IGNORE_CASE)
@@ -223,37 +488,18 @@ class SosDispatcher(private val ctx: Context) {
 
     // =============================================================
     //  ZENVIA WHATSAPP – TEMPLATE APROVADO
-    //
-    //  ESTE BLOCO ESTÁ VALIDADO NOS TESTES EM 18/11/2025
-    //  Qualquer mudança errada aqui pode QUEBRAR o envio pela Meta/Zenvia.
-    //
-    //  NÃO ALTERAR (SEM COORDENAR COM O TEMPLATE):
-    //    • templateId
-    //    • nomes dos campos em "fields": "nome" e "link_rastreamento"
-    //    • estrutura do JSON:
-    //         {
-    //           "type": "template",
-    //           "templateId": "...",
-    //           "fields": {
-    //             "nome": "...",
-    //             "link_rastreamento": "..."
-    //           }
-    //         }
     // =============================================================
-
-    //---------------- Zenvia WhatsApp (TEMPLATE aprovado) ----------------
     private fun sendZenviaWhats(
         msg: String,
         list: List<String>,
-        lat: Double?,
-        lon: Double?
+        linkRastreamento: String?
     ) {
         val token = BuildConfig.ZENVIA_TOKEN
-        val from  = BuildConfig.ZENVIA_WA_FROM
+        val from = BuildConfig.ZENVIA_WA_FROM
 
         Log.d(
             "ZENVIA_WA",
-            "start WA to=${list.size} tokenBlank=${token.isBlank()} fromBlank=${from.isBlank()} lat=$lat lon=$lon"
+            "start WA to=${list.size} tokenBlank=${token.isBlank()} fromBlank=${from.isBlank()} link=$linkRastreamento"
         )
 
         if (token.isBlank() || from.isBlank()) {
@@ -265,6 +511,7 @@ class SosDispatcher(private val ctx: Context) {
         val tos = list
             .map { normalizeMsisdn(it) }
             .filter { it.isNotBlank() }
+            .distinct()
 
         Log.d("ZENVIA_WA", "tosNormalized=$tos")
         if (tos.isEmpty()) {
@@ -273,14 +520,11 @@ class SosDispatcher(private val ctx: Context) {
         }
 
         // Link de rastreamento para o campo {{link_rastreamento}}
-        val trackingLink = mapsLink(lat, lon)
-            ?: "https://maps.google.com/?q=0,0"
+        val trackingLink = (linkRastreamento ?: "https://maps.google.com/?q=0,0").trim()
         Log.d("ZENVIA_WA", "using link_rastreamento=$trackingLink")
 
-        // TEMPLATE aprovado na Zenvia/Meta
         val templateId = "406d05ec-cd3c-4bca-add3-ddd521aef484"
 
-        // Prioriza o "nome completo" do cadastro; se não tiver, cai no texto "ALERTA de ..."
         val nome = getNomeCompletoFromPrefs() ?: extractNomeFromText(msg)
 
         val url = "https://api.zenvia.com/v2/channels/whatsapp/messages"
@@ -321,9 +565,7 @@ class SosDispatcher(private val ctx: Context) {
         }
     }
 
-    // Tira o nome a partir da primeira linha da mensagem "ALERTA de ...":
-    // "🚨 ALERTA de Fulano\nSituação: sos pessoal\n..."
-    // (usado como fallback, se não achar o nome nas SharedPreferences)
+    // Fallback para extrair nome do texto
     private fun extractNomeFromText(msg: String): String {
         val marker = "ALERTA de "
         val idx = msg.indexOf(marker)
@@ -345,7 +587,7 @@ class SosDispatcher(private val ctx: Context) {
 
     // ---------------- E-mail (SendGrid) ----------------
     private fun sendEmailSendGrid(msg: String, list: List<String>) {
-        val key  = BuildConfig.SENDGRID_API_KEY
+        val key = BuildConfig.SENDGRID_API_KEY
         val from = BuildConfig.SENDGRID_FROM
         if (key.isBlank() || from.isBlank()) {
             Log.d("MAIL", "skip MAIL: key/from vazios")

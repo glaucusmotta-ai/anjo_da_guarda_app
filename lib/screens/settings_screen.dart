@@ -4,8 +4,9 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../services/settings_store.dart';
-import '../services/native_sos.dart'; // usamos p/ "Testar envios"
+import '../services/native_sos.dart'; // Testar envios + quickLatLon
 import '../widgets/user_profile_section.dart';
+import '../theme/anjo_theme.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -26,18 +27,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   // PINs
   final _pinMain = TextEditingController();
   final _pinDuress = TextEditingController();
-  final _pinAudio = TextEditingController(); // ainda reservado (futuro / opcional)
+  final _pinAudio = TextEditingController(); // reservado (futuro / opcional)
   bool _showPinMain = false;
   bool _showPinDuress = false;
-  bool _showPinAudio = false; // não exibido no layout, só mantido por compatibilidade
-
-  // Estado visual de gravação das senhas de áudio
-  bool _isRecordingAudio1 = false;
-  bool _isRecordingAudio2 = false;
+  bool _showPinAudio = false; // compatibilidade futura
 
   // Senhas de áudio (coação em 2 etapas)
-  final _audioToken1 = TextEditingController(); // ex: filha / socorro / deus
-  final _audioToken2 = TextEditingController(); // ex: te amo / anjo / ajuda
+  final _audioToken1 = TextEditingController(); // ex: DEUS / FILHA / SOCORRO
+  final _audioToken2 = TextEditingController(); // ex: AJUDA / TE AMO / ANJO
 
   // Preferências
   bool _pinSecondLayerEnabled = true;
@@ -45,8 +42,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _audioEnabled = true; // liga/desliga disparo por voz
 
   // Telegram
-  final _tgTarget =
-      TextEditingController(); // chat_id numérico OU @username/@canal/@grupo
+  final _tgTarget = TextEditingController(); // chat_id numérico OU @username/@canal/@grupo
 
   // SMS (3 destinatários)
   final _smsTo1 = TextEditingController();
@@ -261,7 +257,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     await SettingsStore.instance.saveAll(data);
 
-    // 🔹 Grava Nome, tokens de áudio, toggle e TODOS os destinos nas SharedPreferences (Android nativo lê aqui)
+    // 🔹 Grava Nome, tokens de áudio, toggle e TODOS os destinos nas SharedPreferences
     try {
       final prefs = await SharedPreferences.getInstance();
 
@@ -281,7 +277,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await prefs.setString('smsTo2', _t(_smsTo2.text));
       await prefs.setString('smsTo3', _t(_smsTo3.text));
 
-      // WhatsApp – destinos (mesmos números que a Zenvia)
+      // WhatsApp – destinos
       await prefs.setString('waTo1', _t(_waTo1.text));
       await prefs.setString('waTo2', _t(_waTo2.text));
       await prefs.setString('waTo3', _t(_waTo3.text));
@@ -299,26 +295,156 @@ class _SettingsScreenState extends State<SettingsScreen> {
       const SnackBar(content: Text('Configurações salvas')),
     );
 
-    // vai direto para a tela da 2ª camada (PIN) e limpa o histórico
+    // volta para a tela da 2ª camada (PIN) e limpa o histórico
     Navigator.of(context).pushNamedAndRemoveUntil('/pin', (r) => false);
   }
 
-  Future<void> _captureAudioToken(int which) async {
-    // which = 1 (Senha 1) ou 2 (Senha 2)
+  // ----- Senhas de áudio: editar token pessoal -----
+  Future<void> _editAudioToken(int which) async {
+    final controller = which == 1 ? _audioToken1 : _audioToken2;
+    final label = which == 1 ? 'Senha 1 (armar)' : 'Senha 2 (disparar)';
 
-    setState(() {
-      _isRecordingAudio1 = (which == 1);
-      _isRecordingAudio2 = (which == 2);
-    });
+    final temp = TextEditingController(text: controller.text);
 
-    // depois vamos trocar isso pelo fluxo real de gravação
-    await Future.delayed(const Duration(seconds: 2));
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF111216),
+        title: Text(
+          label,
+          style: const TextStyle(color: Colors.white),
+        ),
+        content: TextField(
+          controller: temp,
+          autofocus: true,
+          style: const TextStyle(color: Colors.white),
+          decoration: const InputDecoration(
+            labelText: 'Palavra ou frase da senha',
+            labelStyle: TextStyle(color: Colors.white70),
+            enabledBorder: UnderlineInputBorder(
+              borderSide: BorderSide(color: Colors.white30),
+            ),
+            focusedBorder: UnderlineInputBorder(
+              borderSide: BorderSide(color: Colors.white),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
 
-    if (!mounted) return;
-    setState(() {
-      _isRecordingAudio1 = false;
-      _isRecordingAudio2 = false;
-    });
+    if (result == true) {
+      setState(() {
+        controller.text = temp.text.trim();
+      });
+    }
+  }
+
+  // ----- Senhas de áudio: revelar token (pede PIN principal antes) -----
+  Future<void> _revealAudioToken(int which) async {
+    final pin = _t(_pinMain.text);
+    if (pin.length != 4) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Defina primeiro o PIN principal nas Configurações.'),
+        ),
+      );
+      return;
+    }
+
+    final pinController = TextEditingController();
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF111216),
+        title: const Text(
+          'Confirme seu PIN',
+          style: TextStyle(color: Colors.white),
+        ),
+        content: TextField(
+          controller: pinController,
+          keyboardType: TextInputType.number,
+          obscureText: true,
+          maxLength: 4,
+          style: const TextStyle(color: Colors.white),
+          decoration: const InputDecoration(
+            counterText: '',
+            labelText: 'PIN principal (4 dígitos)',
+            labelStyle: TextStyle(color: Colors.white70),
+            enabledBorder: UnderlineInputBorder(
+              borderSide: BorderSide(color: Colors.white30),
+            ),
+            focusedBorder: UnderlineInputBorder(
+              borderSide: BorderSide(color: Colors.white),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+
+    if (ok != true) return;
+
+    if (_t(pinController.text) != pin) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('PIN principal incorreto')),
+      );
+      return;
+    }
+
+    final value = _t(which == 1 ? _audioToken1.text : _audioToken2.text);
+
+    if (value.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Senha $which ainda não configurada.'),
+        ),
+      );
+      return;
+    }
+
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF111216),
+        title: Text(
+          'Senha $which de áudio',
+          style: const TextStyle(color: Colors.white),
+        ),
+        content: Text(
+          value,
+          style: const TextStyle(color: Colors.white),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Fechar'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _testSends() async {
@@ -346,7 +472,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() => _testCount++);
     await SettingsStore.instance.setTestCount(_testCount);
 
-    // texto alinhado ao template (sem emojis/aspas especiais)
+    // texto alinhado ao template (backend/nativo monta o padrão completo)
     final ok = await NativeSos.send("sos pessoal", lat: lat, lon: lon);
 
     if (!mounted) return;
@@ -394,12 +520,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return InputDecoration(
       labelText: label,
       hintText: hint,
-      prefixIcon: icon != null ? Icon(icon, color: iconColor) : null,
+      prefixIcon: icon != null
+          ? Icon(icon, color: iconColor ?? Colors.white70)
+          : null,
       suffixIcon: suffix,
-      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+      filled: true,
+      fillColor: Colors.black.withOpacity(0.35),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: const BorderSide(color: Colors.white24),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: BorderSide(color: AnjoTheme.neonBlue, width: 1.5),
+      ),
       isDense: true,
-      contentPadding:
-          const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+      contentPadding: const EdgeInsets.symmetric(
+        horizontal: 12,
+        vertical: 12,
+      ),
     );
   }
 
@@ -409,61 +551,153 @@ class _SettingsScreenState extends State<SettingsScreen> {
     List<Widget> children, {
     String? subtitle,
   }) {
-    return Card(
-      color: const Color(0xFF111216),
-      elevation: 2,
+    return Container(
       margin: const EdgeInsets.symmetric(vertical: 10),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(children: [
-              Icon(icon, size: 18, color: Colors.white70),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      decoration: BoxDecoration(
+        color: AnjoTheme.cardBlue.withOpacity(0.85),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: AnjoTheme.neonBlue.withOpacity(0.6),
+          width: 1,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.6),
+            blurRadius: 16,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Icon(icon, size: 18, color: Colors.white70),
+            const SizedBox(width: 8),
+            Text(
+              title,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w700,
+                letterSpacing: .3,
+              ),
+            ),
+          ]),
+          if (subtitle != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              subtitle,
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          ],
+          const SizedBox(height: 10),
+          ...children
+              .map(
+                (w) => Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: w,
+                ),
+              )
+              .toList(),
+        ],
+      ),
+    );
+  }
+
+  // Pequeno "waveform" de risquinhos ocupando todo o campo
+  Widget _audioWave(bool active) {
+    final color = active ? Colors.white70 : Colors.white24;
+    return Row(
+      children: List.generate(28, (i) {
+        final h = 6.0 + (i % 4) * 3.0;
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 1),
+          child: Container(
+            width: 2,
+            height: h,
+            decoration: BoxDecoration(
+              color: color,
+              borderRadius: BorderRadius.circular(1),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+
+  // Tile visual de áudio: faixa com risquinhos + mic + olhinho
+  Widget _audioTile({
+    required String description,
+    required String value,
+    required VoidCallback onEdit,
+    required VoidCallback onReveal,
+  }) {
+    final hasValue = value.isNotEmpty;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          decoration: BoxDecoration(
+            color: const Color(0xFF1C1D22),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Row(
+            children: [
+              const Icon(Icons.play_arrow, size: 18, color: Colors.white70),
               const SizedBox(width: 8),
-              Text(
-                title,
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: .3,
+              Expanded(
+                child: SizedBox(
+                  height: 22,
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: _audioWave(hasValue),
+                  ),
                 ),
               ),
-            ]),
-            if (subtitle != null) ...[
-              const SizedBox(height: 6),
-              Text(
-                subtitle,
-                style: const TextStyle(color: Colors.white54, fontSize: 12),
+              IconButton(
+                icon: const Icon(Icons.mic, size: 20),
+                tooltip: 'Definir / alterar senha',
+                onPressed: onEdit,
+              ),
+              IconButton(
+                icon: Icon(
+                  Icons.visibility,
+                  size: 20,
+                  color: Colors.grey.shade300,
+                ),
+                tooltip: 'Ver senha (pede PIN)',
+                onPressed: hasValue ? onReveal : null,
               ),
             ],
-            const SizedBox(height: 10),
-            ...children
-                .map(
-                  (w) => Padding(
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: w,
-                  ),
-                )
-                .toList(),
-          ],
+          ),
         ),
-      ),
+        const SizedBox(height: 4),
+        Text(
+          description,
+          style: const TextStyle(
+            color: Colors.white54,
+            fontSize: 11,
+          ),
+        ),
+      ],
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context).copyWith(
-      scaffoldBackgroundColor: Colors.black,
+    final baseTheme = Theme.of(context);
+    final theme = baseTheme.copyWith(
+      scaffoldBackgroundColor: Colors.transparent,
+      textTheme: baseTheme.textTheme.apply(
+        bodyColor: Colors.white,
+        displayColor: Colors.white,
+      ),
       inputDecorationTheme: const InputDecorationTheme(
         labelStyle: TextStyle(color: Colors.white70),
         hintStyle: TextStyle(color: Colors.white38),
       ),
-      textTheme: Theme.of(context)
-          .textTheme
-          .apply(bodyColor: Colors.white, displayColor: Colors.white),
     );
 
     final testsLeft = 2 - _testCount;
@@ -472,363 +706,386 @@ class _SettingsScreenState extends State<SettingsScreen> {
       data: theme,
       child: Scaffold(
         appBar: AppBar(
-          title: const Text('Configurações'),
-          backgroundColor: const Color(0xFF0D0E12),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.save),
-              onPressed: _save,
-              tooltip: 'Salvar',
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          iconTheme: const IconThemeData(color: Colors.white),
+          title: const Text(
+            'Configurações',
+            style: TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w600,
             ),
-          ],
+          ),
         ),
-        body: _loading
-            ? const Center(child: CircularProgressIndicator())
-            : Form(
-                key: _form,
-                autovalidateMode: AutovalidateMode.onUserInteraction,
-                child: ListView(
-                  padding: const EdgeInsets.fromLTRB(14, 12, 14, 90),
-                  children: [
-                    // 🔹 Informações adicionais / região para métricas
-                    UserProfileSection(key: _userProfileKey),
+        body: Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              colors: [Color(0xFF050A1A), Color(0xFF0A1430)],
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+            ),
+          ),
+          child: _loading
+              ? const Center(child: CircularProgressIndicator())
+              : Form(
+                  key: _form,
+                  autovalidateMode: AutovalidateMode.onUserInteraction,
+                  child: ListView(
+                    padding: const EdgeInsets.fromLTRB(14, 12, 14, 90),
+                    children: [
+                      // 🔹 Informações adicionais / região para métricas
+                      _card(
+                        'Informações adicionais',
+                        Icons.location_on_outlined,
+                        [
+                          UserProfileSection(key: _userProfileKey),
+                        ],
+                        subtitle:
+                            'CEP, cidade, bairro e dados usados para métricas '
+                            'e relatórios do Anjo da Guarda.',
+                      ),
 
-                    // Dados do cliente
-                    _card('Seus dados', Icons.person, [
-                      TextFormField(
-                        controller: _userName,
-                        textCapitalization: TextCapitalization.words,
-                        decoration: _dec(
-                          label: 'Nome completo',
-                          icon: Icons.badge,
-                        ),
-                      ),
-                      TextFormField(
-                        controller: _userPhone,
-                        keyboardType: TextInputType.phone,
-                        validator: _validatePhoneE164,
-                        decoration: _dec(
-                          label: 'Telefone principal',
-                          hint: '+559999999999',
-                          icon: Icons.phone,
-                        ),
-                      ),
-                      TextFormField(
-                        controller: _userEmail,
-                        keyboardType: TextInputType.emailAddress,
-                        validator: _validateEmail,
-                        decoration: _dec(
-                          label: 'E-mail principal',
-                          icon: Icons.alternate_email,
-                        ),
-                      ),
-                    ]),
-
-                    // PINs
-                    _card(
-                      'PINs',
-                      Icons.lock_outline,
-                      [
+                      // Dados do cliente
+                      _card('Seus dados', Icons.person, [
                         TextFormField(
-                          controller: _pinMain,
-                          maxLength: 4,
-                          keyboardType: TextInputType.number,
-                          inputFormatters: [
-                            FilteringTextInputFormatter.digitsOnly
-                          ],
-                          obscureText: !_showPinMain,
-                          validator: _validatePin4,
+                          controller: _userName,
+                          textCapitalization: TextCapitalization.words,
+                          style: const TextStyle(color: Colors.white),
                           decoration: _dec(
-                            label: 'PIN principal (4 dígitos)',
-                            icon: Icons.password,
-                            suffix: IconButton(
-                              icon: Icon(_showPinMain
-                                  ? Icons.visibility_off
-                                  : Icons.visibility),
-                              onPressed: () => setState(
-                                () => _showPinMain = !_showPinMain,
+                            label: 'Nome completo',
+                            icon: Icons.badge,
+                          ),
+                        ),
+                        TextFormField(
+                          controller: _userPhone,
+                          keyboardType: TextInputType.phone,
+                          validator: _validatePhoneE164,
+                          style: const TextStyle(color: Colors.white),
+                          decoration: _dec(
+                            label: 'Telefone principal',
+                            hint: '+559999999999',
+                            icon: Icons.phone,
+                          ),
+                        ),
+                        TextFormField(
+                          controller: _userEmail,
+                          keyboardType: TextInputType.emailAddress,
+                          validator: _validateEmail,
+                          style: const TextStyle(color: Colors.white),
+                          decoration: _dec(
+                            label: 'E-mail principal',
+                            icon: Icons.alternate_email,
+                          ),
+                        ),
+                      ]),
+
+                      // PINs
+                      _card(
+                        'PINs',
+                        Icons.lock_outline,
+                        [
+                          TextFormField(
+                            controller: _pinMain,
+                            maxLength: 4,
+                            keyboardType: TextInputType.number,
+                            inputFormatters: [
+                              FilteringTextInputFormatter.digitsOnly
+                            ],
+                            obscureText: !_showPinMain,
+                            validator: _validatePin4,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: _dec(
+                              label: 'PIN principal (4 dígitos)',
+                              icon: Icons.password,
+                              suffix: IconButton(
+                                icon: Icon(
+                                  _showPinMain
+                                      ? Icons.visibility_off
+                                      : Icons.visibility,
+                                  color: Colors.grey.shade300,
+                                ),
+                                onPressed: () => setState(
+                                  () => _showPinMain = !_showPinMain,
+                                ),
                               ),
                             ),
                           ),
+                          const Text(
+                            'Use o PIN principal para acesso normal ao app.',
+                            style:
+                                TextStyle(color: Colors.white54, fontSize: 12),
+                          ),
+                          const SizedBox(height: 6),
+                          TextFormField(
+                            controller: _pinDuress,
+                            maxLength: 4,
+                            keyboardType: TextInputType.number,
+                            inputFormatters: [
+                              FilteringTextInputFormatter.digitsOnly
+                            ],
+                            obscureText: !_showPinDuress,
+                            validator: _validatePin4,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: _dec(
+                              label: 'PIN de coação (4 dígitos)',
+                              icon: Icons.warning_amber,
+                              suffix: IconButton(
+                                icon: Icon(
+                                  _showPinDuress
+                                      ? Icons.visibility_off
+                                      : Icons.visibility,
+                                  color: Colors.grey.shade300,
+                                ),
+                                onPressed: () => setState(
+                                  () => _showPinDuress = !_showPinDuress,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      // Senhas de áudio (coação em 2 etapas)
+                      _card(
+                        'Senhas de Áudio (Coação em 2 etapas)',
+                        Icons.hearing,
+                        [
+                          _audioTile(
+                            description:
+                                'Senha 1 (armar) - Usada para armar o SOS por voz',
+                            value: _audioToken1.text,
+                            onEdit: () => _editAudioToken(1),
+                            onReveal: () => _revealAudioToken(1),
+                          ),
+                          _audioTile(
+                            description:
+                                'Senha 2 (disparar) - Dispara o SOS se dita logo após a senha 1',
+                            value: _audioToken2.text,
+                            onEdit: () => _editAudioToken(2),
+                            onReveal: () => _revealAudioToken(2),
+                          ),
+                          const Text(
+                            'Funcionamento: ao reconhecer a Senha 1 o sistema fica armado por ~2 segundos. '
+                            'Se dentro dessa janela reconhecer a Senha 2, dispara o SOS. '
+                            'Se falar só a primeira e não completar, nada é enviado.',
+                            style:
+                                TextStyle(color: Colors.white54, fontSize: 12),
+                          ),
+                        ],
+                      ),
+
+                      // Telegram
+                      _card('Telegram', Icons.send, [
+                        TextFormField(
+                          controller: _tgTarget,
+                          keyboardType: TextInputType.text,
+                          validator: _validateTgTarget,
+                          style: const TextStyle(color: Colors.white),
+                          decoration: _dec(
+                            label: 'Destino',
+                            hint: 'chat_id numérico ou @canal/@grupo/@username',
+                            icon: Icons.confirmation_number,
+                          ),
                         ),
                         const Text(
-                          'Use o PIN principal para acesso normal ao app.',
+                          'Observação: bots NÃO iniciam conversa por @username. '
+                          'Para pessoa física, inicie chat com o bot (com /start) e use o chat_id numérico.',
                           style:
                               TextStyle(color: Colors.white54, fontSize: 12),
                         ),
-                        const SizedBox(height: 6),
-                        TextFormField(
-                          controller: _pinDuress,
-                          maxLength: 4,
-                          keyboardType: TextInputType.number,
-                          inputFormatters: [
-                            FilteringTextInputFormatter.digitsOnly
-                          ],
-                          obscureText: !_showPinDuress,
-                          validator: _validatePin4,
-                          decoration: _dec(
-                            label: 'PIN de coação (4 dígitos)',
-                            icon: Icons.warning_amber,
-                            suffix: IconButton(
-                              icon: Icon(_showPinDuress
-                                  ? Icons.visibility_off
-                                  : Icons.visibility),
-                              onPressed: () => setState(
-                                () => _showPinDuress = !_showPinDuress,
-                              ),
+                      ]),
+
+                      // SMS
+                      _card(
+                        'SMS',
+                        Icons.sms_outlined,
+                        [
+                          TextFormField(
+                            controller: _smsTo1,
+                            keyboardType: TextInputType.phone,
+                            validator: _validatePhoneE164,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: _dec(
+                              label: 'Destinatário 1',
+                              hint: '+559999999999',
+                              icon: Icons.phone_iphone,
                             ),
                           ),
-                        ),
-                      ],
-                    ),
+                          TextFormField(
+                            controller: _smsTo2,
+                            keyboardType: TextInputType.phone,
+                            validator: _validatePhoneE164,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: _dec(
+                              label: 'Destinatário 2 (opcional)',
+                              hint: '+559999999999',
+                              icon: Icons.phone_iphone,
+                            ),
+                          ),
+                          TextFormField(
+                            controller: _smsTo3,
+                            keyboardType: TextInputType.phone,
+                            validator: _validatePhoneE164,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: _dec(
+                              label: 'Destinatário 3 (opcional)',
+                              hint: '+559999999999',
+                              icon: Icons.phone_iphone,
+                            ),
+                          ),
+                        ],
+                        subtitle:
+                            'Preencha no formato +559999999999 (sem espaços).',
+                      ),
 
-                    // Senhas de áudio (coação em 2 etapas)
-                    _card(
-                      'Senhas de Áudio (Coação em 2 etapas)',
-                      Icons.hearing,
-                      [
+                      // WhatsApp
+                      _card(
+                        'WhatsApp',
+                        Icons.chat,
+                        [
+                          TextFormField(
+                            controller: _waTo1,
+                            keyboardType: TextInputType.phone,
+                            validator: _validatePhoneE164,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: _dec(
+                              label: 'Destinatário 1',
+                              hint: '+559999999999',
+                              icon: Icons.chat,
+                            ),
+                          ),
+                          TextFormField(
+                            controller: _waTo2,
+                            keyboardType: TextInputType.phone,
+                            validator: _validatePhoneE164,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: _dec(
+                              label: 'Destinatário 2 (opcional)',
+                              hint: '+559999999999',
+                              icon: Icons.chat,
+                            ),
+                          ),
+                          TextFormField(
+                            controller: _waTo3,
+                            keyboardType: TextInputType.phone,
+                            validator: _validatePhoneE164,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: _dec(
+                              label: 'Destinatário 3 (opcional)',
+                              hint: '+559999999999',
+                              icon: Icons.chat,
+                            ),
+                          ),
+                        ],
+                        subtitle:
+                            'Preencha no formato +559999999999 (sem espaços).',
+                      ),
+
+                      // E-mail
+                      _card('E-mail', Icons.email_outlined, [
                         TextFormField(
-                          controller: _audioToken1,
-                          readOnly: true,
-                          enableInteractiveSelection: false,
-                          onTap: () {
-                            // impede teclado e chama o “gravar”
-                            FocusScope.of(context).requestFocus(FocusNode());
-                            _captureAudioToken(1);
-                          },
+                          controller: _emailTo1,
+                          keyboardType: TextInputType.emailAddress,
+                          validator: _validateEmail,
+                          style: const TextStyle(color: Colors.white),
                           decoration: _dec(
-                            label: 'Senha 1 (armar)',
-                            hint: 'Toque no microfone para gravar',
-                            icon: Icons.mic,
-                            iconColor: _isRecordingAudio1
-                                ? Colors.green
-                                : Colors.white70,
+                            label: 'Destinatário 1',
+                            hint: 'ex: contato@dominio.com',
+                            icon: Icons.person,
                           ),
                         ),
                         TextFormField(
-                          controller: _audioToken2,
-                          readOnly: true,
-                          enableInteractiveSelection: false,
-                          onTap: () {
-                            FocusScope.of(context).requestFocus(FocusNode());
-                            _captureAudioToken(2);
-                          },
+                          controller: _emailTo2,
+                          keyboardType: TextInputType.emailAddress,
+                          validator: _validateEmail,
+                          style: const TextStyle(color: Colors.white),
                           decoration: _dec(
-                            label: 'Senha 2 (disparar)',
-                            hint: 'Toque no microfone para gravar',
-                            icon: Icons.mic,
-                            iconColor: _isRecordingAudio2
-                                ? Colors.green
-                                : Colors.white70,
+                            label: 'Destinatário 2 (opcional)',
+                            hint: 'ex: contato2@dominio.com',
+                            icon: Icons.person,
+                          ),
+                        ),
+                        TextFormField(
+                          controller: _emailTo3,
+                          keyboardType: TextInputType.emailAddress,
+                          validator: _validateEmail,
+                          style: const TextStyle(color: Colors.white),
+                          decoration: _dec(
+                            label: 'Destinatário 3 (opcional)',
+                            hint: 'ex: contato3@dominio.com',
+                            icon: Icons.person,
                           ),
                         ),
                         const Text(
-                          'Funcionamento: ao reconhecer a Senha 1 o sistema fica armado por ~2 segundos. '
-                          'Se dentro dessa janela reconhecer a Senha 2, dispara o SOS. '
-                          'Se falar só a primeira e não completar, nada é enviado.',
-                          style: TextStyle(color: Colors.white54, fontSize: 12),
+                          'Os parâmetros do provedor de e-mail são gerenciados pelo Anjo da Guarda.',
+                          style:
+                              TextStyle(color: Colors.white54, fontSize: 12),
                         ),
-                      ],
-                    ),
+                      ]),
 
-                    // Telegram (chat_id OU @canal/@grupo/@username)
-                    _card('Telegram', Icons.send, [
-                      TextFormField(
-                        controller: _tgTarget,
-                        keyboardType: TextInputType.text,
-                        validator: _validateTgTarget,
-                        decoration: _dec(
-                          label: 'Destino',
-                          hint: 'chat_id numérico ou @canal/@grupo/@username',
-                          icon: Icons.confirmation_number,
+                      // Preferências
+                      _card('Preferências', Icons.tune, [
+                        SwitchListTile(
+                          value: _pinSecondLayerEnabled,
+                          onChanged: (v) =>
+                              setState(() => _pinSecondLayerEnabled = v),
+                          title: const Text('Usar segunda camada de PIN'),
+                          subtitle: const Text(
+                            'Se desativar, o app abre direto sem a tela de PIN.',
+                          ),
+                          contentPadding: EdgeInsets.zero,
+                          activeColor: AnjoTheme.neonGreen,
                         ),
-                      ),
-                      const Text(
-                        'Observação: bots NÃO iniciam conversa por @username. '
-                        'Para pessoa física, inicie chat com o bot (com /start) e use o chat_id numérico.',
-                        style: TextStyle(color: Colors.white54, fontSize: 12),
-                      ),
-                    ]),
-
-                    // SMS
-                    _card(
-                      'SMS',
-                      Icons.sms_outlined,
-                      [
-                        TextFormField(
-                          controller: _smsTo1,
-                          keyboardType: TextInputType.phone,
-                          validator: _validatePhoneE164,
-                          decoration: _dec(
-                            label: 'Destinatário 1',
-                            hint: '+559999999999',
-                            icon: Icons.phone_iphone,
+                        // toggle para disparo por voz
+                        SwitchListTile(
+                          value: _audioEnabled,
+                          onChanged: (v) =>
+                              setState(() => _audioEnabled = v),
+                          title: const Text('Ativar disparo por voz (beta)'),
+                          subtitle: const Text(
+                            'Se desativar, o SOS por áudio fica desligado; use apenas o PIN de coação.',
+                          ),
+                          contentPadding: EdgeInsets.zero,
+                          activeColor: AnjoTheme.neonGreen,
+                        ),
+                        SwitchListTile(
+                          value: _qsEnabled,
+                          onChanged: (v) => setState(() => _qsEnabled = v),
+                          title: const Text('Atalho SOS no painel rápido'),
+                          subtitle: const Text(
+                            'Mostra o azulejo “SOS – Anjo da Guarda” nas Configurações Rápidas.',
+                          ),
+                          contentPadding: EdgeInsets.zero,
+                          activeColor: AnjoTheme.neonGreen,
+                        ),
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: OutlinedButton.icon(
+                            onPressed: _showHowToTileDialog,
+                            icon: const Icon(Icons.help_outline),
+                            label: const Text('Como ativar o atalho'),
                           ),
                         ),
-                        TextFormField(
-                          controller: _smsTo2,
-                          keyboardType: TextInputType.phone,
-                          validator: _validatePhoneE164,
-                          decoration: _dec(
-                            label: 'Destinatário 2 (opcional)',
-                            hint: '+559999999999',
-                            icon: Icons.phone_iphone,
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Testar envios'),
+                          subtitle: Text(
+                            _testCount < 2
+                                ? 'Você ainda pode fazer $testsLeft teste(s).'
+                                : 'Limite de testes atingido. Use “Iniciar serviço”.',
+                            style: const TextStyle(color: Colors.white54),
+                          ),
+                          trailing: ElevatedButton.icon(
+                            onPressed: _testCount >= 2 ? null : _testSends,
+                            icon: const Icon(Icons.bolt),
+                            label: const Text('Testar'),
                           ),
                         ),
-                        TextFormField(
-                          controller: _smsTo3,
-                          keyboardType: TextInputType.phone,
-                          validator: _validatePhoneE164,
-                          decoration: _dec(
-                            label: 'Destinatário 3 (opcional)',
-                            hint: '+559999999999',
-                            icon: Icons.phone_iphone,
-                          ),
-                        ),
-                      ],
-                      subtitle:
-                          'Preencha no formato +559999999999 (sem espaços).',
-                    ),
-
-                    // WhatsApp
-                    _card(
-                      'WhatsApp',
-                      Icons.chat,
-                      [
-                        TextFormField(
-                          controller: _waTo1,
-                          keyboardType: TextInputType.phone,
-                          validator: _validatePhoneE164,
-                          decoration: _dec(
-                            label: 'Destinatário 1',
-                            hint: '+559999999999',
-                            icon: Icons.chat,
-                          ),
-                        ),
-                        TextFormField(
-                          controller: _waTo2,
-                          keyboardType: TextInputType.phone,
-                          validator: _validatePhoneE164,
-                          decoration: _dec(
-                            label: 'Destinatário 2 (opcional)',
-                            hint: '+559999999999',
-                            icon: Icons.chat,
-                          ),
-                        ),
-                        TextFormField(
-                          controller: _waTo3,
-                          keyboardType: TextInputType.phone,
-                          validator: _validatePhoneE164,
-                          decoration: _dec(
-                            label: 'Destinatário 3 (opcional)',
-                            hint: '+559999999999',
-                            icon: Icons.chat,
-                          ),
-                        ),
-                      ],
-                      subtitle:
-                          'Preencha no formato +559999999999 (sem espaços).',
-                    ),
-
-                    // E-mail
-                    _card('E-mail', Icons.email_outlined, [
-                      TextFormField(
-                        controller: _emailTo1,
-                        keyboardType: TextInputType.emailAddress,
-                        validator: _validateEmail,
-                        decoration: _dec(
-                          label: 'Destinatário 1',
-                          hint: 'ex: contato@dominio.com',
-                          icon: Icons.person,
-                        ),
-                      ),
-                      TextFormField(
-                        controller: _emailTo2,
-                        keyboardType: TextInputType.emailAddress,
-                        validator: _validateEmail,
-                        decoration: _dec(
-                          label: 'Destinatário 2 (opcional)',
-                          hint: 'ex: contato2@dominio.com',
-                          icon: Icons.person,
-                        ),
-                      ),
-                      TextFormField(
-                        controller: _emailTo3,
-                        keyboardType: TextInputType.emailAddress,
-                        validator: _validateEmail,
-                        decoration: _dec(
-                          label: 'Destinatário 3 (opcional)',
-                          hint: 'ex: contato3@dominio.com',
-                          icon: Icons.person,
-                        ),
-                      ),
-                      const Text(
-                        'Os parâmetros do provedor de e-mail são gerenciados pelo Anjo da Guarda.',
-                        style:
-                            TextStyle(color: Colors.white54, fontSize: 12),
-                      ),
-                    ]),
-
-                    // 🔹 Preferências
-                    _card('Preferências', Icons.tune, [
-                      SwitchListTile(
-                        value: _pinSecondLayerEnabled,
-                        onChanged: (v) =>
-                            setState(() => _pinSecondLayerEnabled = v),
-                        title: const Text('Usar segunda camada de PIN'),
-                        subtitle: const Text(
-                          'Se desativar, o app abre direto sem a tela de PIN.',
-                        ),
-                        contentPadding: EdgeInsets.zero,
-                      ),
-                      // toggle para disparo por voz
-                      SwitchListTile(
-                        value: _audioEnabled,
-                        onChanged: (v) =>
-                            setState(() => _audioEnabled = v),
-                        title: const Text('Ativar disparo por voz (beta)'),
-                        subtitle: const Text(
-                          'Se desativar, o SOS por áudio fica desligado; use apenas o PIN de coação.',
-                        ),
-                        contentPadding: EdgeInsets.zero,
-                      ),
-                      SwitchListTile(
-                        value: _qsEnabled,
-                        onChanged: (v) => setState(() => _qsEnabled = v),
-                        title: const Text('Atalho SOS no painel rápido'),
-                        subtitle: const Text(
-                          'Mostra o azulejo “SOS – Anjo da Guarda” nas Configurações Rápidas.',
-                        ),
-                        contentPadding: EdgeInsets.zero,
-                      ),
-                      Align(
-                        alignment: Alignment.centerLeft,
-                        child: OutlinedButton.icon(
-                          onPressed: _showHowToTileDialog,
-                          icon: const Icon(Icons.help_outline),
-                          label: const Text('Como ativar o atalho'),
-                        ),
-                      ),
-                      ListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Testar envios'),
-                        subtitle: Text(
-                          _testCount < 2
-                              ? 'Você ainda pode fazer $testsLeft teste(s).'
-                              : 'Limite de testes atingido. Use “Iniciar serviço”.',
-                          style: const TextStyle(color: Colors.white54),
-                        ),
-                        trailing: ElevatedButton.icon(
-                          onPressed:
-                              _testCount >= 2 ? null : _testSends,
-                          icon: const Icon(Icons.bolt),
-                          label: const Text('Testar'),
-                        ),
-                      ),
-                    ]),
-                  ],
+                      ]),
+                    ],
+                  ),
                 ),
-              ),
+        ),
         floatingActionButton: _loading
             ? null
             : FloatingActionButton.extended(

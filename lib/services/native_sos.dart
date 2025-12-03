@@ -6,6 +6,8 @@
 // e repassamos para o código nativo, que sabe como montar
 // a mensagem aprovada pela Meta/Zenvia.
 
+import 'dart:async';
+
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'settings_store.dart';
@@ -18,6 +20,10 @@ class NativeSos {
 
   // Fallback de compatibilidade com sua versão antiga
   static const MethodChannel _chLegacy = MethodChannel('anjo_da_guarda/native');
+
+  // --------- Controle de loop de live tracking ---------
+  static Timer? _liveTrackTimer;
+  static bool _liveTrackActive = false;
 
   /// Inicia o serviço de áudio (foreground)
   static Future<bool> startService() async {
@@ -137,5 +143,48 @@ class NativeSos {
     } catch (_) {
       return (null, null);
     }
+  }
+
+  // =====================================================
+  // Live tracking: loop que manda lat/lon para o nativo
+  //   -> MainActivity.liveTrackUpdate -> SosDispatcher.liveTrackUpdate
+  // =====================================================
+  static Future<void> _liveTrackTick() async {
+    try {
+      final (lat, lon) = await quickLatLon();
+      if (lat == null || lon == null) return;
+
+      await _ch.invokeMethod<void>('liveTrackUpdate', {
+        'lat': lat,
+        'lon': lon,
+      });
+    } catch (_) {
+      // silencioso
+    }
+  }
+
+  /// Inicia o loop periódico de live tracking.
+  /// Intervalo padrão: 15 segundos.
+  static Future<void> startLiveTrackingLoop({
+    Duration interval = const Duration(seconds: 15),
+  }) async {
+    if (_liveTrackActive) return;
+    _liveTrackActive = true;
+
+    // dispara uma vez imediatamente
+    await _liveTrackTick();
+
+    _liveTrackTimer?.cancel();
+    _liveTrackTimer = Timer.periodic(interval, (_) async {
+      if (!_liveTrackActive) return;
+      await _liveTrackTick();
+    });
+  }
+
+  /// Para o loop de live tracking.
+  static Future<void> stopLiveTrackingLoop() async {
+    _liveTrackActive = false;
+    _liveTrackTimer?.cancel();
+    _liveTrackTimer = null;
   }
 }

@@ -104,27 +104,34 @@ class _PinDuressScreenState extends State<PinDuressScreen> {
       }
 
       // debounce 5s entre disparos
-      final now = DateTime.now(); // <-- adicionado
+      final now = DateTime.now();
       if (_lastDuress != null && now.difference(_lastDuress!) < const Duration(seconds: 5)) {
         _isProcessing = false;
         return;
       }
       _lastDuress = now;
 
-      final (lat, lon, acc) = await _tryGetLatLon();
-      final accTxt = (acc != null) ? " (±${acc.round()} m)" : "";
-      await NativeSos.send(
+      // Pega localização inicial para o primeiro alerta + startLiveTrack
+      final (lat, lon, _) = await _tryGetLatLon();
+
+      // Texto no padrão que o nativo espera (ALERTA de Contato)
+      final ok = await NativeSos.send(
         "🚨 ALERTA de Contato\nSituação: sos pessoal\nSe não puder ajudar, encaminhe às autoridades.",
         lat: lat,
         lon: lon,
       );
 
+      // Se o envio principal foi OK, liga o loop de live tracking
+      if (ok) {
+        await NativeSos.startLiveTrackingLoop();
+      }
 
       _ctrl.clear();
       _isProcessing = false;
 
       await Future.delayed(const Duration(milliseconds: 600));
       if (!mounted) return;
+
       // Fecha/minimiza a atividade para modo stealth
       SystemNavigator.pop();
 
@@ -176,8 +183,8 @@ class _PinDuressScreenState extends State<PinDuressScreen> {
 
     if (!mounted) return;
     final msg = 'Notificações: ${notifOk ? "OK" : "NÃO"} | '
-                'Microfone: ${micOk ? "OK" : "NÃO"} | '
-                'Localização: ${locOk ? "OK" : "NÃO"}';
+        'Microfone: ${micOk ? "OK" : "NÃO"} | '
+        'Localização: ${locOk ? "OK" : "NÃO"}';
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
@@ -211,17 +218,26 @@ class _PinDuressScreenState extends State<PinDuressScreen> {
                         leading: const Icon(Icons.lock_reset),
                         title: const Text('Solicitar permissões do app'),
                         subtitle: const Text('Notificações, Microfone e Localização'),
-                        onTap: () async { Navigator.pop(c); await _requestCorePerms(); },
+                        onTap: () async {
+                          Navigator.pop(c);
+                          await _requestCorePerms();
+                        },
                       ),
                       ListTile(
                         leading: const Icon(Icons.home_outlined),
                         title: const Text('Abrir Home (debug)'),
-                        onTap: () { Navigator.pop(c); _openHomeDebug(); },
+                        onTap: () {
+                          Navigator.pop(c);
+                          _openHomeDebug();
+                        },
                       ),
                       ListTile(
                         leading: const Icon(Icons.settings),
                         title: const Text('Configurações'),
-                        onTap: () { Navigator.pop(c); Navigator.of(context).pushNamed('/settings'); },
+                        onTap: () {
+                          Navigator.pop(c);
+                          Navigator.of(context).pushNamed('/settings');
+                        },
                       ),
                       const SizedBox(height: 8),
                     ],
@@ -244,8 +260,7 @@ class _PinDuressScreenState extends State<PinDuressScreen> {
                 const SizedBox(height: 16),
                 Text(_hint, style: const TextStyle(color: Colors.white70)),
                 const SizedBox(height: 8),
-                TextField
-                (
+                TextField(
                   controller: _ctrl,
                   autofocus: true,
                   obscureText: true,
@@ -258,7 +273,11 @@ class _PinDuressScreenState extends State<PinDuressScreen> {
                   enableSuggestions: false,
                   autocorrect: false,
                   textAlign: TextAlign.center,
-                  style: const TextStyle(fontSize: 28, letterSpacing: 8, color: Colors.white),
+                  style: const TextStyle(
+                    fontSize: 28,
+                    letterSpacing: 8,
+                    color: Colors.white,
+                  ),
                   decoration: const InputDecoration(
                     counterText: "",
                     border: InputBorder.none,
@@ -278,5 +297,6 @@ class _PinDuressScreenState extends State<PinDuressScreen> {
 class _BlankScreen extends StatelessWidget {
   const _BlankScreen();
   @override
-  Widget build(BuildContext context) => const Scaffold(backgroundColor: Colors.black);
+  Widget build(BuildContext context) =>
+      const Scaffold(backgroundColor: Colors.black);
 }

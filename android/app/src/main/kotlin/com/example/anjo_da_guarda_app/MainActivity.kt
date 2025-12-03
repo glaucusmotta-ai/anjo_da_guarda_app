@@ -52,7 +52,7 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
-        // ===== Canal novo de controle do serviço (voz) =====
+        // ===== Canal novo de controle do serviço (voz + live track) =====
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CH_SOS)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -98,7 +98,6 @@ class MainActivity : FlutterActivity() {
                         }
                     }
 
-
                     // Consultar status
                     "isServiceRunning" -> {
                         result.success(AudioService.isRunning)
@@ -123,6 +122,14 @@ class MainActivity : FlutterActivity() {
                             waTo = waTo,
                             emailTo = emailTo
                         )
+                        result.success(true)
+                    }
+
+                    // 🔴 NOVO: update de live tracking vindo do Flutter
+                    "liveTrackUpdate" -> {
+                        val lat = call.argument<Double>("lat")
+                        val lon = call.argument<Double>("lon")
+                        SosDispatcher(this).liveTrackUpdate(lat, lon)
                         result.success(true)
                     }
 

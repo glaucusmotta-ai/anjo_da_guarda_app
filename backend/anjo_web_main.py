@@ -19,6 +19,10 @@ from email.utils import formataddr, formatdate
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import URLError, HTTPError
+from fastapi import HTTPException
+from service_mapa import salvar_ponto_trilha, listar_pontos_trilha
+
+
 
 import html as _html
 from string import Template
@@ -34,7 +38,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-
 # ---------------------------------------------------------
 # Logs + .env
 # ---------------------------------------------------------
@@ -45,12 +48,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.normpath(os.path.join(BASE_DIR, "..", ".env"))
 load_dotenv(ENV_PATH, override=True)
 logger.info("[ENV] usando .env em %s", ENV_PATH)
-# Removido o segundo load_dotenv geral pra não sobrescrever com outro .env perdido
-# load_dotenv(override=True)
 
 DATA_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "anjo.db")
+SCHEMA_SQL_PATH = os.path.join(BASE_DIR, "db_schema.sql")
+
 
 # ---------------------------------------------------------
 # Config
@@ -90,6 +93,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ---------------------------------------------------------
 # Forçar IPv4 para evitar bloqueio Cloudflare
 # ---------------------------------------------------------
@@ -101,6 +105,7 @@ def _force_ipv4():
 
 
 _force_ipv4()
+
 
 # ---------------------------------------------------------
 # Helpers gerais
@@ -119,7 +124,7 @@ def _valid_coords(lat: Optional[float], lon: Optional[float]) -> bool:
 
 
 def _coords_str(lat: float, lon: float) -> Tuple[str, str]:
-    return (f"{float(lat):.7f}", f"{float(lon):.7f}")
+    return f"{float(lat):.7f}", f"{float(lon):.7f}"
 
 
 def _maps_url(lat: float, lon: float) -> str:
@@ -148,9 +153,13 @@ logger.info(
 
 def _create_live_tracking_session(
     nome: Optional[str],
+    phone: Optional[str],
     lat: Optional[float],
     lon: Optional[float],
 ) -> Optional[Tuple[str, str]]:
+    """
+    Cria uma sessão de rastreamento em memória e devolve (session_id, tracking_url).
+    """
     if not _valid_coords(lat, lon):
         return None
     try:
@@ -163,11 +172,20 @@ def _create_live_tracking_session(
     session_id = secrets.token_urlsafe(10)
     LIVE_TRACK_SESSIONS[session_id] = {
         "nome": (nome or "").strip() or "contato",
+        "phone": (phone or "").strip(),
         "lat": lat_f,
         "lon": lon_f,
+        "created_at": now,
         "updated_at": now,
+        "active": True,
         "track": [{"lat": lat_f, "lon": lon_f, "ts": now}],
     }
+
+    # Salva o primeiro ponto da trilha no banco (sessões criadas via /api/sos)
+    try:
+        salvar_ponto_trilha(session_id, lat_f, lon_f, now)
+    except Exception as e:
+        logger.error("[TRACK] erro ao salvar ponto inicial da trilha (SOS): %s", e)
 
     if TRACKING_BASE_URL:
         base = TRACKING_BASE_URL.rstrip("/")
@@ -175,7 +193,6 @@ def _create_live_tracking_session(
         base = CFG.public_base_url.rstrip("/")
 
     tracking_url = f"{base}/t/{session_id}"
-
     logger.info(
         "[TRACK] nova sessão id=%s base=%s PUBLIC_BASE_URL=%s TRACKING_BASE_URL=%s",
         session_id,
@@ -183,7 +200,6 @@ def _create_live_tracking_session(
         CFG.public_base_url,
         TRACKING_BASE_URL,
     )
-
     return session_id, tracking_url
 
 
@@ -192,8 +208,7 @@ def live_track_state(session_id: str):
     data = LIVE_TRACK_SESSIONS.get(session_id)
     if not data:
         return JSONResponse(
-            status_code=404,
-            content={"ok": False, "reason": "SESSION_NOT_FOUND"},
+            status_code=404, content={"ok": False, "reason": "SESSION_NOT_FOUND"}
         )
 
     return {
@@ -202,13 +217,20 @@ def live_track_state(session_id: str):
         "lat": data.get("lat"),
         "lon": data.get("lon"),
         "nome": data.get("nome"),
+        "phone": data.get("phone"),
         "updated_at": data.get("updated_at"),
+        "active": bool(data.get("active", True)),
     }
 
 
 @app.post("/api/live-track/start")
 def live_track_start(payload: Dict[str, Any], request: Request):
-    nome = (payload.get("nome") or "").strip() or "nome"
+    """
+    Inicia uma sessão de live-tracking direto (sem passar pelo /api/sos),
+    usado, por exemplo, pela central.
+    """
+    nome = (str(payload.get("nome") or "").strip() or "contato")
+    phone = (str(payload.get("phone") or "").strip() or "")
     lat = payload.get("lat")
     lon = payload.get("lon")
 
@@ -229,11 +251,20 @@ def live_track_start(payload: Dict[str, Any], request: Request):
     session_id = secrets.token_urlsafe(10)
     LIVE_TRACK_SESSIONS[session_id] = {
         "nome": nome,
+        "phone": phone,
         "lat": lat_f,
         "lon": lon_f,
+        "created_at": now,
         "updated_at": now,
+        "active": True,
         "track": [{"lat": lat_f, "lon": lon_f, "ts": now}],
     }
+
+    # Salva o primeiro ponto da trilha no banco
+    try:
+        salvar_ponto_trilha(session_id, lat_f, lon_f, now)
+    except Exception as e:
+        logger.error("[TRACK] erro ao salvar ponto inicial da trilha: %s", e)
 
     if TRACKING_BASE_URL:
         base = TRACKING_BASE_URL.rstrip("/")
@@ -251,10 +282,18 @@ def live_track_start(payload: Dict[str, Any], request: Request):
 
 @app.post("/api/live-track/update")
 def live_track_update(payload: Dict[str, Any]):
-    session_id = (payload.get("session_id") or payload.get("id") or "").strip()
+    session_id = (str(payload.get("session_id") or payload.get("id") or "")).strip()
     if not session_id or session_id not in LIVE_TRACK_SESSIONS:
         return JSONResponse(
-            status_code=404, content={"ok": False, "reason": "SESSION_NOT_FOUND"}
+            status_code=404,
+            content={"ok": False, "reason": "SESSION_NOT_FOUND"},
+        )
+
+    session = LIVE_TRACK_SESSIONS[session_id]
+    if not session.get("active", True):
+        return JSONResponse(
+            status_code=410,
+            content={"ok": False, "reason": "SESSION_INACTIVE"},
         )
 
     lat = payload.get("lat")
@@ -272,20 +311,39 @@ def live_track_update(payload: Dict[str, Any]):
             status_code=400, content={"ok": False, "reason": "INVALID_COORDS"}
         )
 
-    session = LIVE_TRACK_SESSIONS[session_id]
+    now = _now()
     session["lat"] = lat_f
     session["lon"] = lon_f
-    session["updated_at"] = _now()
+    session["updated_at"] = now
 
     track = session.get("track")
     if not isinstance(track, list):
         track = []
-    track.append({"lat": lat_f, "lon": lon_f, "ts": _now()})
+    track.append({"lat": lat_f, "lon": lon_f, "ts": now})
     if len(track) > 500:
         track.pop(0)
     session["track"] = track
 
-    return {"ok": True}
+    # Persiste também no banco para trilha confiável
+    try:
+        salvar_ponto_trilha(session_id, lat_f, lon_f, now)
+    except Exception as e:
+        logger.error("[TRACK] erro ao salvar ponto da trilha no banco: %s", e)
+
+    logger.info(
+        "[TRACK UPDATE] id=%s ts=%s lat=%.7f lon=%.7f n_points=%d",
+        session_id,
+        now,
+        lat_f,
+        lon_f,
+        len(track),
+    )
+
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "updated_at": now,
+    }
 
 
 @app.get("/api/live-track/last/{session_id}")
@@ -295,13 +353,16 @@ def live_track_last(session_id: str):
         return JSONResponse(
             status_code=404, content={"ok": False, "reason": "SESSION_NOT_FOUND"}
         )
+
     out = {"ok": True, "session_id": session_id}
     out.update(
         {
             "nome": data.get("nome"),
+            "phone": data.get("phone"),
             "lat": data.get("lat"),
             "lon": data.get("lon"),
             "updated_at": data.get("updated_at"),
+            "active": bool(data.get("active", True)),
         }
     )
     return out
@@ -309,11 +370,41 @@ def live_track_last(session_id: str):
 
 @app.get("/api/live-track/track/{session_id}")
 def live_track_track(session_id: str):
+    """
+    Devolve a trilha em memória; se não houver, tenta reconstruir a partir
+    da tabela live_track_points (service_mapa).
+    """
     data = LIVE_TRACK_SESSIONS.get(session_id)
+
     if not data:
-        return JSONResponse(
-            status_code=404, content={"ok": False, "reason": "SESSION_NOT_FOUND"}
-        )
+        # fallback: tenta carregar do banco
+        try:
+            points = listar_pontos_trilha(session_id)
+        except Exception as e:
+            logger.error("[TRACK] erro ao carregar trilha do banco: %s", e)
+            points = []
+
+        if not points:
+            return JSONResponse(
+                status_code=404,
+                content={"ok": False, "reason": "SESSION_NOT_FOUND"},
+            )
+
+        # Reconstrói sessão mínima em memória a partir do histórico
+        last = points[-1]
+        data = {
+            "nome": "contato",
+            "phone": "",
+            "lat": last["lat"],
+            "lon": last["lon"],
+            "updated_at": last["ts"],
+            "active": True,
+            "track": [
+                {"lat": p["lat"], "lon": p["lon"], "ts": p["ts"]}
+                for p in points
+            ],
+        }
+        LIVE_TRACK_SESSIONS[session_id] = data
 
     track = data.get("track") or []
     safe_track = []
@@ -329,23 +420,301 @@ def live_track_track(session_id: str):
         "ok": True,
         "session_id": session_id,
         "nome": data.get("nome"),
+        "phone": data.get("phone"),
         "track": safe_track,
+        "active": bool(data.get("active", True)),
     }
 
 
-@app.get("/t/{session_id}")
-def live_track_page(session_id: str):
-    if session_id not in LIVE_TRACK_SESSIONS:
-        return HTMLResponse(
-            "<h3>Rastreamento não encontrado ou encerrado.</h3>", status_code=404
+@app.post("/api/live-track/stop")
+def live_track_stop(payload: Dict[str, Any]):
+    sid = (str(payload.get("session_id") or payload.get("id") or "")).strip()
+    if not sid or sid not in LIVE_TRACK_SESSIONS:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "reason": "SESSION_NOT_FOUND"},
         )
 
+    session = LIVE_TRACK_SESSIONS[sid]
+    session["active"] = False
+    session["stopped_at"] = _now()
+    session["updated_at"] = _now()
+
+    logger.info(
+        "[TRACK] sessão encerrada pelo app id=%s nome=%s",
+        sid,
+        session.get("nome"),
+    )
+    return {"ok": True}
+
+
+@app.get("/api/live-track/list")
+def live_track_list():
+    """
+    Lista todas as sessões de rastreamento em memória para a central 24/7.
+    """
+    sessions_out = []
+
+    # Base do link (sempre anjo-track.3g-brasil.com no seu caso)
+    if TRACKING_BASE_URL:
+        base = TRACKING_BASE_URL.rstrip("/")
+    else:
+        base = CFG.public_base_url.rstrip("/")
+
+    now = datetime.utcnow()
+
+    for sid, data in LIVE_TRACK_SESSIONS.items():
+        lat = data.get("lat")
+        lon = data.get("lon")
+        if not _valid_coords(lat, lon):
+            continue
+
+        updated_at = data.get("updated_at")
+
+        # flag que vem da sessão (live-track/stop marca active=False)
+        session_flag = bool(data.get("active", True))
+        active = session_flag
+
+        # só consideramos "ativo" se tiver atualização recente (<= 15 min)
+        if updated_at:
+            try:
+                dt = datetime.fromisoformat(updated_at)
+                age = (now - dt).total_seconds()
+                active = session_flag and (age <= 900)
+            except Exception:
+                active = session_flag
+
+        try:
+            lat_f = float(lat)
+            lon_f = float(lon)
+        except Exception:
+            continue
+
+        sessions_out.append(
+            {
+                "id": sid,
+                "nome": data.get("nome") or "contato",
+                "phone": data.get("phone") or "",
+                "lat": lat_f,
+                "lon": lon_f,
+                "updated_at": updated_at,
+                "active": active,
+                "tracking_url": f"{base}/t/{sid}",
+            }
+        )
+
+    return {"ok": True, "sessions": sessions_out}
+
+
+@app.delete("/api/live-track/session/{session_id}")
+def live_track_delete(session_id: str):
+    """Remove uma sessão de rastreamento da memória (central 24/7)."""
+    if session_id in LIVE_TRACK_SESSIONS:
+        try:
+            del LIVE_TRACK_SESSIONS[session_id]
+        except KeyError:
+            pass
+        return {"ok": True, "deleted": True}
+    return JSONResponse(
+        status_code=404,
+        content={"ok": False, "reason": "SESSION_NOT_FOUND"},
+    )
+
+
+@app.get("/api/live-track/points/{session_id}")
+def api_live_track_points(session_id: str):
+    points = listar_pontos_trilha(session_id)
+    if not points:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada")
+    return JSONResponse({"ok": True, "points": points})
+
+
+from fastapi import HTTPException
+from fastapi.responses import HTMLResponse
+
+# ... aqui em cima já deve existir logger, get_db, etc.
+
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/t/{session_id}", response_class=HTMLResponse)
+async def tracking_public(session_id: str):
+    """
+    Página pública de rastreamento para celular.
+    - Mesmo visual do mapa central (Leaflet + OpenStreetMap simples).
+    - NÃO usa banco direto: busca a sessão na API /api/live-track/list.
+    - Atualiza a posição a cada 15 segundos em "tempo quase real".
+    """
+    html = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8">
+    <title>Rastreamento - Anjo da Guarda</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <!-- tudo em tela cheia no celular -->
+    <style>
+      html, body {{
+        height: 100%;
+        margin: 0;
+        padding: 0;
+      }}
+      body {{
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #000;
+        color: #eee;
+      }}
+      .header {{
+        padding: 8px 12px;
+        font-size: 13px;
+        background: #111;
+        border-bottom: 1px solid #333;
+      }}
+      .header strong {{
+        display: block;
+        font-size: 15px;
+        margin-bottom: 2px;
+      }}
+      #info-line {{
+        margin-top: 2px;
+      }}
+      #map {{
+        width: 100%;
+        height: calc(100% - 52px);
+      }}
+    </style>
+
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+</head>
+<body>
+    <div class="header">
+        <strong>Rastreamento - Anjo da Guarda</strong>
+        <div>Rastreamento em tempo quase real</div>
+        <div id="info-line">Carregando sessão...</div>
+    </div>
+
+    <div id="map"></div>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin="">
+    </script>
+
+    <script>
+      const SESSION_ID = "{session_id}";
+
+      const map = L.map('map');
+
+      // Mesmo tile simples da central (OpenStreetMap, sem nome de loja)
+      const tileLayer = L.tileLayer(
+        'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+        {{
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap contributors'
+        }}
+      ).addTo(map);
+
+      let marker = null;
+      let hasFirstFix = false;
+
+      function atualizarMapa() {{
+        fetch('/api/live-track/list')
+          .then(r => r.json())
+          .then(data => {{
+            // a API pode devolver {{sessions: [...]}} ou direto um array
+            const lista = Array.isArray(data) ? data : (data.sessions || []);
+
+            if (!Array.isArray(lista)) {{
+              console.log('Resposta inesperada de /api/live-track/list', data);
+              return;
+            }}
+
+            const sess = lista.find(s => {{
+              const sid = s.id || s.session_id || s.code || s.token;
+              return sid === SESSION_ID;
+            }});
+
+            if (!sess) {{
+              document.getElementById('info-line').textContent =
+                'Sessão não encontrada ou encerrada.';
+              return;
+            }}
+
+            const lat =
+              sess.lat ??
+              sess.latitude ??
+              sess.last_lat ??
+              (sess.last_point && (sess.last_point.lat ?? sess.last_point.latitude));
+
+            const lon =
+              sess.lon ??
+              sess.lng ??
+              sess.longitude ??
+              sess.last_lon ??
+              (sess.last_point && (sess.last_point.lon ?? sess.last_point.lng ?? sess.last_point.longitude));
+
+            if (lat == null || lon == null) {{
+              document.getElementById('info-line').textContent =
+                'Sessão encontrada, mas ainda sem posição.';
+              return;
+            }}
+
+            const ts =
+              sess.ts ||
+              sess.last_ts ||
+              (sess.last_point && (sess.last_point.ts || sess.last_point.time || sess.last_point.created_at)) ||
+              '';
+
+            const nome =
+              sess.display_name ||
+              sess.name ||
+              sess.nome ||
+              sess.phone ||
+              SESSION_ID;
+
+            document.getElementById('info-line').textContent =
+              `Sessão: ${{nome}} — Última atualização: ${{ts}}`;
+
+            const pos = [lat, lon];
+
+            if (!hasFirstFix) {{
+              hasFirstFix = true;
+              map.setView(pos, 18);
+              marker = L.marker(pos).addTo(map);
+            }} else if (marker) {{
+              marker.setLatLng(pos);
+            }}
+          }})
+          .catch(err => {{
+            console.error('Erro ao buscar lista de sessões', err);
+          }});
+      }}
+
+      // primeira carga
+      atualizarMapa();
+      // atualiza a cada 15 segundos
+      setInterval(atualizarMapa, 15000);
+    </script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html)
+
+
+@app.get("/central", response_class=HTMLResponse)
+def central_page():
     html = """
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
       <meta charset="utf-8">
-      <title>Rastreamento - Anjo da Guarda</title>
+      <title>Central de Rastreamento - Anjo da Guarda</title>
       <meta name="viewport" content="width=device-width, initial-scale=1"/>
 
       <link
@@ -356,42 +725,110 @@ def live_track_page(session_id: str):
       />
 
       <style>
+        * {
+          box-sizing: border-box;
+        }
         body {
           margin: 0;
           font-family: Arial, sans-serif;
           background: #000;
           color: #fff;
         }
-        header {
-          padding: 10px 16px;
+        #topbar {
           background: #111;
+          padding: 10px 16px;
           font-size: 14px;
           line-height: 1.4;
+          border-bottom: 1px solid #333;
+        }
+        #title {
+          font-weight: bold;
         }
         #status {
           font-size: 12px;
-          opacity: 0.85;
+          opacity: 0.8;
         }
-        #hint {
-          font-size: 11px;
-          opacity: 0.7;
+        #actions {
           margin-top: 4px;
+          font-size: 12px;
+        }
+        .btn {
+          display: inline-block;
+          padding: 4px 8px;
+          margin-right: 6px;
+          border-radius: 3px;
+          border: 1px solid #444;
+          background: #222;
+          color: #fff;
+          cursor: pointer;
+        }
+        .btn:hover {
+          background: #333;
+        }
+        #container {
+          display: flex;
+          height: calc(100vh - 72px);
         }
         #map {
-          width: 100vw;
-          height: calc(100vh - 70px);
+          flex: 2;
+        }
+        #sidebar {
+          flex: 1;
+          max-width: 360px;
+          background: #111;
+          border-left: 1px solid #333;
+          padding: 8px 12px;
+          overflow-y: auto;
+        }
+        #sidebar h3 {
+          margin-top: 4px;
+          margin-bottom: 8px;
+          font-size: 14px;
+        }
+        #sessions-list {
+          list-style: none;
+          padding: 0;
+          margin: 0;
+          font-size: 13px;
+        }
+        #sessions-list li {
+          padding: 6px 4px;
+          border-bottom: 1px solid #222;
+          cursor: pointer;
+        }
+        #sessions-list li:hover {
+          background: #222;
+        }
+        #sessions-list small {
+          color: #aaa;
+        }
+        #sessions-list a.encerrar {
+          color: #f66;
+          font-size: 11px;
+          margin-left: 6px;
+          text-decoration: none;
+        }
+        #sessions-list a.encerrar:hover {
+          text-decoration: underline;
         }
       </style>
     </head>
     <body>
-      <header>
-        <div>🚨 Rastreamento em tempo (quase) real</div>
-        <div id="status">Carregando localização...</div>
-        <div id="hint">
-          A linha no mapa mostra o caminho percorrido pelo aparelho de quem pediu ajuda.
+      <div id="topbar">
+        <div id="title">🚨 Central de Rastreamento - Anjo da Guarda</div>
+        <div id="status">Carregando sessões...</div>
+        <div id="actions">
+          <span class="btn" id="btn-fit">Visão geral</span>
+          <span class="btn" id="btn-toggle-sidebar">Ocultar lista</span>
         </div>
-      </header>
-      <div id="map"></div>
+      </div>
+      <div id="container">
+        <div id="map"></div>
+        <div id="sidebar">
+          <h3>Sessões ativas</h3>
+          <ul id="sessions-list"></ul>
+        </div>
+      </div>
 
       <script
         src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
@@ -400,86 +837,170 @@ def live_track_page(session_id: str):
       </script>
 
       <script>
-        const parts = window.location.pathname.split("/");
-        const sessionId = parts[parts.length - 1] || parts[parts.length - 2];
         const statusEl = document.getElementById("status");
+        const listEl = document.getElementById("sessions-list");
+        const btnFit = document.getElementById("btn-fit");
+        const sidebar = document.getElementById("sidebar");
+        const btnToggleSidebar = document.getElementById("btn-toggle-sidebar");
 
-        let map = null;
-        let marker = null;
-        let polyline = null;
-        let initialized = false;
+        let map = L.map("map").setView([-14.2350, -51.9253], 4);
 
-        function initMap(lat, lon) {
-          map = L.map("map").setView([lat, lon], 17);
-
-          L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-            maxZoom: 19,
-            attribution: "&copy; OpenStreetMap contributors"
-          }).addTo(map);
-
-          marker = L.marker([lat, lon]).addTo(map);
-          polyline = L.polyline([[lat, lon]]).addTo(map);
-        }
-
-        function updateRoute(track, nome) {
-          if (!Array.isArray(track) || track.length === 0) {
-            statusEl.textContent = "Aguardando primeira localização do aparelho...";
-            return;
-          }
-
-          const coords = track
-            .map(p => [p.lat, p.lon])
-            .filter(([lat, lon]) =>
-              typeof lat === "number" && !isNaN(lat) &&
-              typeof lon === "number" && !isNaN(lon)
-            );
-
-          if (coords.length === 0) {
-            statusEl.textContent = "Aguardando primeira localização válida...";
-            return;
-          }
-
-          const [firstLat, firstLon] = coords[0];
-          const [lastLat, lastLon] = coords[coords.length - 1];
-
-          if (!initialized) {
-            initMap(firstLat, firstLon);
-            initialized = true;
-          }
-
-          polyline.setLatLngs(coords);
-          marker.setLatLng([lastLat, lastLon]);
-
-          const now = new Date();
-          statusEl.textContent = "Última posição de " + (nome || "contato") +
-            " às " + now.toLocaleTimeString();
-
-          if (coords.length > 1) {
-            const bounds = L.latLngBounds(coords);
-            map.fitBounds(bounds, { padding: [20, 20] });
+        let sidebarVisible = true;
+        btnToggleSidebar.onclick = () => {
+          sidebarVisible = !sidebarVisible;
+          if (sidebarVisible) {
+            sidebar.style.display = "block";
+            btnToggleSidebar.textContent = "Ocultar lista";
           } else {
-            map.setView([lastLat, lastLon], 17);
+            sidebar.style.display = "none";
+            btnToggleSidebar.textContent = "Mostrar lista";
+          }
+          setTimeout(() => {
+            map.invalidateSize();
+          }, 200);
+        };
+
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          maxZoom: 19,
+          attribution: "&copy; OpenStreetMap contributors"
+        }).addTo(map);
+
+        const markers = {};
+        let autoFit = true;
+        let lastCoordsAll = [];
+
+        map.on("movestart", () => {
+          autoFit = false;
+        });
+
+        function updateSessions(sessions) {
+          const seen = new Set();
+          const coordsAll = [];
+          listEl.innerHTML = "";
+
+          sessions.forEach((s) => {
+            if (typeof s.lat !== "number" || typeof s.lon !== "number") {
+              return;
+            }
+            const id = s.id;
+            seen.add(id);
+            coordsAll.push([s.lat, s.lon]);
+
+            let marker = markers[id];
+            const nome = s.nome || "contato";
+            const phone = s.phone || "";
+            const last = s.updated_at || "";
+            const active = !!s.active;
+            const trackUrl = s.tracking_url || ("/t/" + encodeURIComponent(id));
+
+            const popupHtml =
+              "<b>" + nome + "</b>" +
+              (phone ? "<br/>📱 " + phone : "") +
+              "<br/>⏱ " + last +
+              "<br/>" +
+              (active
+                ? "<span style='color:#0f0;'>Ativo</span>"
+                : "<span style='color:#f80;'>Encerrado</span>") +
+              "<br/><a href='" + trackUrl +
+              "' target='_blank' rel='noopener'>Abrir trilha detalhada</a>";
+
+            const baseStyle = active
+              ? { radius: 8, color: "#0f0", weight: 2, fillColor: "#0f0", fillOpacity: 0.7 }
+              : { radius: 8, color: "#f80", weight: 2, fillColor: "#666", fillOpacity: 0.6 };
+
+            if (!marker) {
+              marker = L.circleMarker([s.lat, s.lon], baseStyle).addTo(map);
+              markers[id] = marker;
+            } else {
+              marker.setLatLng([s.lat, s.lon]);
+              marker.setStyle(baseStyle);
+            }
+            marker.bindPopup(popupHtml);
+
+            const li = document.createElement("li");
+            li.innerHTML =
+              "<b>" + nome + "</b>" +
+              (phone ? " — " + phone : "") +
+              " <small>(" + (active ? "ativo" : "encerrado") + ")</small>" +
+              " <a href='#' class='encerrar' data-id='" + id + "'>encerrar</a>";
+
+            li.onclick = () => {
+              map.setView([s.lat, s.lon], 16);
+              marker.openPopup();
+            };
+
+            const linkEncerrar = li.querySelector("a.encerrar");
+            linkEncerrar.onclick = async (ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              if (!confirm("Encerrar rastreamento deste contato?")) return;
+              try {
+                const resp = await fetch(
+                  "/api/live-track/session/" + encodeURIComponent(id),
+                  { method: "DELETE" }
+                );
+                if (resp.ok) {
+                  // remove item e marcador localmente
+                  li.remove();
+                  if (markers[id]) {
+                    map.removeLayer(markers[id]);
+                    delete markers[id];
+                  }
+                  statusEl.textContent = "Sessão encerrada. Atualizando...";
+                }
+              } catch (e) {
+                console.error(e);
+              }
+            };
+
+            listEl.appendChild(li);
+          });
+
+          // remove marcadores de sessões que sumiram
+          Object.keys(markers).forEach((id) => {
+            if (!seen.has(id)) {
+              map.removeLayer(markers[id]);
+              delete markers[id];
+            }
+          });
+
+          lastCoordsAll = coordsAll.slice();
+
+          if (coordsAll.length > 0) {
+            if (autoFit) {
+              const bounds = L.latLngBounds(coordsAll);
+              map.fitBounds(bounds, { padding: [30, 30] });
+            }
+            statusEl.textContent = "Sessões em memória: " + coordsAll.length;
+          } else {
+            statusEl.textContent = "Nenhum rastreamento ativo no momento.";
           }
         }
+
+        btnFit.onclick = () => {
+          if (lastCoordsAll.length > 0) {
+            const bounds = L.latLngBounds(lastCoordsAll);
+            map.fitBounds(bounds, { padding: [30, 30] });
+          } else {
+            map.setView([-14.2350, -51.9253], 4);
+          }
+          autoFit = true;
+        };
 
         async function poll() {
           try {
-            const resp = await fetch("/api/live-track/track/" + encodeURIComponent(sessionId));
+            const resp = await fetch("/api/live-track/list");
             if (!resp.ok) {
-              statusEl.textContent = "Sessão de rastreamento encerrada.";
-              return;
-            }
-            const data = await resp.json();
-            if (data && data.ok) {
-              updateRoute(data.track || [], data.nome);
+              statusEl.textContent = "Erro ao buscar sessões.";
             } else {
-              statusEl.textContent = "Aguardando localização...";
+              const data = await resp.json();
+              updateSessions(data.sessions || []);
             }
           } catch (e) {
             console.error(e);
-            statusEl.textContent = "Erro ao atualizar localização. Tentando novamente...";
+            statusEl.textContent = "Erro de comunicação com o servidor.";
           } finally {
-            setTimeout(poll, 5000);
+            setTimeout(poll, 3000);
           }
         }
 
@@ -489,6 +1010,8 @@ def live_track_page(session_id: str):
     </html>
     """
     return HTMLResponse(html)
+
+
 
 # ---------------------------------------------------------
 # DB helpers (SQLite)
@@ -501,6 +1024,7 @@ def db() -> sqlite3.Connection:
 
 def db_init():
     with db() as con:
+
         con.executescript(
             """
         PRAGMA foreign_keys=ON;
@@ -657,21 +1181,27 @@ def db_init():
 
         # Migrações idempotentes
         try:
-            con.execute("ALTER TABLE users RENAME TO users_tmp")
+            con.execute("ALTER TABLE sos_audit ADD COLUMN phone TEXT")
         except Exception:
-            # já migrado, ignora
             pass
 
-        # Se o rename acima falhar, tabela continua ok; então criamos de volta se necessário
         try:
-            cols = [
-                r["name"]
-                for r in con.execute("PRAGMA table_info(users)").fetchall()
-            ]
+            con.execute("ALTER TABLE metrics_events ADD COLUMN phone TEXT")
+        except Exception:
+            pass
+
+        # Migração antiga de users (mantida, mas cuidadosa)
+        try:
+            con.execute("ALTER TABLE users RENAME TO users_tmp")
+        except Exception:
+            # se falhar, já está ok; não faz nada
+            pass
+
+        try:
+            cols = [r["name"] for r in con.execute("PRAGMA table_info(users)").fetchall()]
         except Exception:
             cols = []
 
-        # Se não existir, recria com schema correto
         if not cols:
             con.executescript(
                 """
@@ -689,6 +1219,7 @@ def db_init():
 
 db_init()
 
+
 # ---------------------------------------------------------
 # Utils: password hash
 # ---------------------------------------------------------
@@ -702,6 +1233,7 @@ def _verify_password(pwd: str, b64hash: str, b64salt: str) -> bool:
     salt = base64.b64decode(b64salt)
     dk2, _ = _hash_password(pwd, salt)
     return hmac.compare_digest(dk2, b64hash)
+
 
 # ---------------------------------------------------------
 # Templates Telegram
@@ -722,6 +1254,7 @@ def render_tg_sos_html(user_text: Optional[str], maps_link: Optional[str]) -> st
     return _TG_SOS_TEMPLATE.safe_substitute(
         TEXT_LINE=text_line, MAPS_LINE=maps_line
     ).strip()
+
 
 # ---------------------------------------------------------
 # WhatsApp helpers (Zenvia)
@@ -830,6 +1363,7 @@ def send_wa_to_numbers(
         results.append(r)
     return results
 
+
 # ---------------------------------------------------------
 # E-mail (Zoho-friendly)
 # ---------------------------------------------------------
@@ -906,6 +1440,7 @@ def send_email(subject: str, body: str, to_list: Optional[List[str]] = None) -> 
         )
         return {"ok": False, "reason": "EMAIL_SEND_FAILED", "errors": tried}
 
+
 # ---------------------------------------------------------
 # SMS Zenvia (legado/env)
 # ---------------------------------------------------------
@@ -973,6 +1508,7 @@ def send_sms_zenvia_list(text: str) -> list:
         results.append(send_sms_zenvia_once(from_alias, _msisdn_clean(to_raw), text))
     return results
 
+
 # ---------------------------------------------------------
 # WA Zenvia (legado/env)
 # ---------------------------------------------------------
@@ -997,6 +1533,7 @@ def send_wa_zenvia_list_template(fields: Dict[str, Any]) -> list:
             send_wa_template_zenvia_once(from_alias, _msisdn_clean(to), template_id, fields)
         )
     return results
+
 
 # ---------------------------------------------------------
 # Telegram helpers
@@ -1110,6 +1647,7 @@ def _send_telegram_location_once(chat_id: str, lat: float, lon: float) -> Dict[s
     except Exception as e:
         logger.error("[TG] LOC EXC chat=%s %s", chat_id, e)
         return {"ok": False, "reason": str(e), "chat_id": chat_id}
+
 
 # ---------------------------------------------------------
 # Live Location Telegram (/api/live/* e /track/<live_id>)
@@ -1227,7 +1765,7 @@ def _edit_telegram_live_once(chat_id: str, message_id: int, lat: float, lon: flo
             "chat_id": chat_id,
         }
     except Exception as e:
-        logger.error("[TG] LIVE EDIT EXC chat=%s msg=%s %s", chat_id, e)
+        logger.error("[TG] LIVE EDIT EXC chat=%s msg=%s", chat_id, e)
         return {"ok": False, "reason": str(e), "chat_id": chat_id}
 
 
@@ -1253,7 +1791,7 @@ def _stop_telegram_live_once(chat_id: str, message_id: int):
             "chat_id": chat_id,
         }
     except Exception as e:
-        logger.error("[TG] LIVE STOP EXC chat=%s msg=%s %s", chat_id, e)
+        logger.error("[TG] LIVE STOP EXC chat=%s msg=%s", chat_id, e)
         return {"ok": False, "reason": str(e), "chat_id": chat_id}
 
 
@@ -1490,6 +2028,7 @@ def track_page(live_id: str):
     """
     return HTMLResponse(content=html)
 
+
 # ---------------------------------------------------------
 # MODELOS SOS / AUTH / ONBOARDING
 # ---------------------------------------------------------
@@ -1502,11 +2041,13 @@ class SosIn(BaseModel):
     s1: Optional[str] = None
     s2: Optional[str] = None
     user_email: Optional[str] = None
+    phone: Optional[str] = None  # telefone principal do usuário (E.164)
 
 
 class RegisterIn(BaseModel):
     email: Optional[str] = None
     password: str
+
 
 # ---------------------------------------------------------
 # AUTH: registro + confirmação + consentimento
@@ -1608,6 +2149,7 @@ def auth_consent(
 
     return RedirectResponse(url=f"/onboarding/profile?token={token}", status_code=302)
 
+
 # ---------------------------------------------------------
 # Debug Zenvia config
 # ---------------------------------------------------------
@@ -1625,8 +2167,9 @@ def debug_zenvia_conf():
         "token_set": bool(os.getenv("ZENVIA_API_TOKEN", "").strip()),
     }
 
+
 # ---------------------------------------------------------
-# Onboarding: perfil + contatos (mantive apenas fluxo básico)
+# Onboarding: perfil + contatos (fluxo básico)
 # ---------------------------------------------------------
 @app.get("/onboarding/profile")
 def profile_form(token: str):
@@ -1794,6 +2337,7 @@ async def contacts_save(request: Request):
     """
     return HTMLResponse(html)
 
+
 # ---------------------------------------------------------
 # Webhook Telegram (ativação de contatos Telegram)
 # ---------------------------------------------------------
@@ -1842,6 +2386,7 @@ async def telegram_webhook(update: Dict[str, Any], bg: BackgroundTasks):
                 None,
             )
     return {"ok": True}
+
 
 # ---------------------------------------------------------
 # Webhook Zenvia (DLR)
@@ -1976,6 +2521,7 @@ async def zenvia_webhook(request: Request):
         logger.error("[ZENVIA WH][DB] %s", e)
         return JSONResponse(status_code=200, content={"ok": True})
 
+
 # ---------------------------------------------------------
 # Helpers: contatos / nome template
 # ---------------------------------------------------------
@@ -2006,6 +2552,7 @@ def _resolve_nome_for_template(user_id: Optional[int], payload: SosIn) -> Option
         return payload.s1.strip()
     return None
 
+
 # ---------------------------------------------------------
 # Endpoints de saúde
 # ---------------------------------------------------------
@@ -2018,6 +2565,7 @@ def ping():
 def health():
     return {"ok": True, "ts": _now()}
 
+
 # ---------------------------------------------------------
 # SOS principal
 # ---------------------------------------------------------
@@ -2025,12 +2573,17 @@ def health():
 async def api_sos(payload: SosIn):
     lat, lon, acc = payload.lat, payload.lon, payload.acc
 
+    # Telefone do remetente (vem do app em phone ou s2)
+    phone = (payload.phone or payload.s2 or "").strip() or None
+
     # Live tracking para link de rastreio
     nome_for_track = (payload.nome or payload.s1 or "").strip() or None
+    phone_for_track = phone or ""
+
     tracking_id: Optional[str] = None
     tracking_url: Optional[str] = None
     if _valid_coords(lat, lon):
-        res = _create_live_tracking_session(nome_for_track, lat, lon)
+        res = _create_live_tracking_session(nome_for_track, phone_for_track, lat, lon)
         if res:
             tracking_id, tracking_url = res
 
@@ -2108,14 +2661,13 @@ async def api_sos(payload: SosIn):
             nome_final = nome_tpl or nome_env or ""
 
             if use_simple_wa or not template_id:
-                # modo texto simples
                 wa_text = f"SOS - {maps_link or ''}".strip()
                 tpl_fields = None
+                if tracking_url:
+                    wa_text = f"{wa_text}\nRastreamento: {tracking_url}".strip()
             else:
                 # Template SOS_ALERTA:
-                # {{1}} -> nome
-                # {{2}} -> link do Google Maps
-                # {{3}} -> link do mapa rastreável
+                # {{1}} -> nome, {{2}} -> link Google Maps, {{3}} -> link rastreável
                 gm_link = maps_link
                 if not gm_link and _valid_coords(lat, lon):
                     gm_link = _maps_url(float(lat), float(lon))
@@ -2131,8 +2683,8 @@ async def api_sos(payload: SosIn):
             logger.info("[WA][USER] results=%s", wa_user_results)
             sent_whatsapp = 1 if any(r.get("ok") for r in wa_user_results) else 0
 
-        # SMS por contato do usuário — deixamos para fase futura
         if contacts["sms"]:
+            # SMS por contato cadastrado (futuro)
             sent_sms = sent_sms or 0
 
         if contacts["telegram"] and CFG.tg_enabled:
@@ -2165,6 +2717,7 @@ async def api_sos(payload: SosIn):
         r = send_email(subject, body, None)
         sent_email = 1 if r.get("ok") else 0
 
+        # SMS legado
         try:
             token_ok = bool(os.getenv("ZENVIA_API_TOKEN"))
             to_raw = os.getenv("ZENVIA_SMS_TO_LIST", "")
@@ -2255,6 +2808,7 @@ async def api_sos(payload: SosIn):
         except Exception as e:
             logger.error("[SMS] erro ao enviar: %s", e)
 
+        # WA legado
         try:
             wa_enabled = (
                 os.getenv(
@@ -2280,7 +2834,6 @@ async def api_sos(payload: SosIn):
                 )
 
                 if use_simple_wa or not template_id:
-                    # modo texto simples (sem template)
                     wa_text = (
                         f"🚨 ALERTA de {(nome_tpl or 'contato')}\n"
                         f"Situação: {(payload.text or '').strip()}\n"
@@ -2289,10 +2842,6 @@ async def api_sos(payload: SosIn):
                     ).strip()
                     tpl_fields = None
                 else:
-                    # Template SOS_ALERTA:
-                    # {{1}} -> nome
-                    # {{2}} -> link do Google Maps
-                    # {{3}} -> link do mapa rastreável
                     gm_link = maps_link
                     if not gm_link and _valid_coords(lat, lon):
                         gm_link = _maps_url(float(lat), float(lon))
@@ -2354,12 +2903,22 @@ async def api_sos(payload: SosIn):
                         time.sleep(CFG.tg_broadcast_throttle_ms / 1000.0)
         sent_telegram = 1 if any_ok else 0
 
+    # Auditoria SOS (com phone)
     with db() as con:
         con.execute(
             """
-            INSERT INTO sos_audit(user_id, payload_json, sent_email, sent_sms, sent_whatsapp, sent_telegram, created_at)
-            VALUES(?,?,?,?,?,?,?)
-        """,
+            INSERT INTO sos_audit(
+                user_id,
+                payload_json,
+                sent_email,
+                sent_sms,
+                sent_whatsapp,
+                sent_telegram,
+                created_at,
+                phone
+            )
+            VALUES(?,?,?,?,?,?,?,?)
+            """,
             (
                 user_id,
                 json.dumps(payload.dict()),
@@ -2368,8 +2927,38 @@ async def api_sos(payload: SosIn):
                 sent_whatsapp,
                 sent_telegram,
                 _now(),
+                phone,
             ),
         )
+
+    # Métrica SOS para relatórios / Power BI (com phone)
+    try:
+        with db() as con:
+            con.execute(
+                """
+                INSERT INTO metrics_events(
+                    user_id,
+                    event_type,
+                    channel,
+                    lat,
+                    lon,
+                    created_at,
+                    phone
+                )
+                VALUES(?,?,?,?,?,?,?)
+                """,
+                (
+                    user_id,
+                    "sos_trigger",
+                    "multi",
+                    float(lat) if _valid_coords(lat, lon) else None,
+                    float(lon) if _valid_coords(lat, lon) else None,
+                    _now(),
+                    phone,
+                ),
+            )
+    except Exception as e:
+        logger.error("[METRICS] erro ao registrar evento SOS: %s", e)
 
     ok = any([sent_email, sent_sms, sent_whatsapp, sent_telegram])
     return JSONResponse(
@@ -2388,6 +2977,7 @@ async def api_sos(payload: SosIn):
             },
         },
     )
+
 
 # ---------------------------------------------------------
 # Debug DLR SMS/WA
@@ -2420,6 +3010,44 @@ def debug_wa_dlr_recent(limit: int = 20):
             (limit,),
         ).fetchall()
     return {"rows": [dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------
+# Métricas: SOS por telefone (para dashboards / Power BI)
+# ---------------------------------------------------------
+@app.get("/api/metrics/sos_by_phone")
+def metrics_sos_by_phone(days: int = 30):
+    """
+    Retorna a contagem de disparos de SOS por telefone
+    nos últimos N dias (padrão 30).
+    """
+    if days <= 0 or days > 365:
+        days = 30
+
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT
+                phone,
+                COUNT(*) AS total_sos,
+                MIN(created_at) AS first_sos,
+                MAX(created_at) AS last_sos
+            FROM sos_audit
+            WHERE phone IS NOT NULL
+              AND phone <> ''
+              AND datetime(created_at) >= datetime('now', ?)
+            GROUP BY phone
+            ORDER BY total_sos DESC
+            """,
+            (f"-{days} days",),
+        ).fetchall()
+
+    return {
+        "ok": True,
+        "days": days,
+        "rows": [dict(r) for r in rows],
+    }
+
 
 # ---------------------------------------------------------
 # Estáticos

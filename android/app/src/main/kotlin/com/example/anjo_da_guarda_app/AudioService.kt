@@ -6,22 +6,23 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
+import android.graphics.Typeface
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
-import android.text.SpannableString
-import android.text.Spanned
-import android.text.style.StyleSpan
-import android.graphics.Typeface
-import androidx.core.app.NotificationCompat
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
-import java.text.Normalizer
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.StyleSpan
 import android.util.Log
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import android.content.pm.PackageManager
 import com.google.android.gms.location.LocationServices
@@ -30,6 +31,8 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.MediaType.Companion.toMediaType
 import org.json.JSONObject
+import java.text.Normalizer
+import java.util.Calendar
 
 class AudioService : Service(), RecognitionListener {
 
@@ -45,7 +48,11 @@ class AudioService : Service(), RecognitionListener {
         // AÇÃO QUE O NATIVE SOS ESTÁ ENVIANDO (ACTION_STOP_SOS)
         const val ACTION_STOP = "ACTION_STOP_SOS"
 
-        @JvmStatic var isRunning: Boolean = false
+        // Intervalo para reavaliar hibernação/agenda
+        private const val HIBERNATION_INTERVAL_MS = 5_000L   // 5 segundos
+
+        @JvmStatic
+        var isRunning: Boolean = false
     }
 
     private lateinit var nm: NotificationManager
@@ -53,12 +60,21 @@ class AudioService : Service(), RecognitionListener {
     private lateinit var recIntent: Intent
     private val handler = Handler(Looper.getMainLooper())
 
-    private fun fullyReleaseRecognizer() {
-        try { recognizer?.cancel() } catch (_: Throwable) {}
-        try { recognizer?.setRecognitionListener(null) } catch (_: Throwable) {}
-        try { recognizer?.destroy() } catch (_: Throwable) {}
-        recognizer = null
+    // Loop da hibernação / agenda
+    private val hibernationHandler = Handler(Looper.getMainLooper())
+    private val hibernationRunnable = object : Runnable {
+        override fun run() {
+            try {
+                updateHibernationFromPrefsAndApply("timer")
+            } catch (t: Throwable) {
+                Log.e(TAG, "Erro no loop de hibernação", t)
+            }
+            // reavalia a cada HIBERNATION_INTERVAL_MS
+            hibernationHandler.postDelayed(this, HIBERNATION_INTERVAL_MS)
+        }
     }
+
+    private var audioManager: AudioManager? = null
 
     // HTTP (Telegram + Zenvia + SendGrid)
     private val http by lazy { OkHttpClient() }
@@ -76,15 +92,32 @@ class AudioService : Service(), RecognitionListener {
     private var resetArmedRunnable: Runnable? = null
     private val MAX_WINDOW_MS = 2000L  // 2 segundos
 
+    // Proteção contra disparos duplicados em curto intervalo
+    private var lastAlertAtMs: Long = 0L
+    private val MIN_ALERT_INTERVAL_MS = 5000L  // 5 segundos
+
+    // Estado lógico do áudio (depois de hibernação / agenda / toggle geral)
+    private var audioGloballyEnabled: Boolean = true
+    private var lastLogicalAudioEnabled: Boolean? = null
+
     override fun onCreate() {
         super.onCreate()
         isRunning = true
         ensureSosChannel()
         nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
         loadAudioTokensFromPrefs()
-        startForeground(NOTIF_ID, baseNotification())
         setupRecognizer()
-        startListening()
+
+        // Notificação de foreground básica
+        startForeground(NOTIF_ID, baseNotification())
+
+        // Aplica hibernação / agenda / áudio habilitado logo na criação
+        updateHibernationFromPrefsAndApply("onCreate")
+
+        // Inicia loop de reavaliação
+        hibernationHandler.post(hibernationRunnable)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -94,16 +127,16 @@ class AudioService : Service(), RecognitionListener {
         if (action == ACTION_STOP) {
             Log.d(TAG, "ACTION_STOP recebido — encerrando serviço de áudio")
 
-            // 1) Para qualquer re-listen pendente
+            // Para re-listen e loop de hibernação
             handler.removeCallbacksAndMessages(null)
+            hibernationHandler.removeCallbacksAndMessages(null)
 
-            // 2) Reseta a sequência de wake word
+            // Reseta sequência de wake word
             resetWakeSequence()
 
-            // 3) Libera o recognizer / microfone
+            // Libera recognizer / microfone
             fullyReleaseRecognizer()
 
-            // 4) Atualiza flag e encerra o foreground
             isRunning = false
             try { stopForeground(true) } catch (_: Throwable) {}
             stopSelf()
@@ -111,11 +144,11 @@ class AudioService : Service(), RecognitionListener {
             return START_NOT_STICKY
         }
 
-        // Fluxo normal – serviço ouvindo
+        // Fluxo normal – reaplica preferências
         if (recognizer == null) {
             setupRecognizer()
         }
-        startListening()
+        updateHibernationFromPrefsAndApply("onStartCommand")
         isRunning = true
         return START_STICKY
     }
@@ -125,6 +158,7 @@ class AudioService : Service(), RecognitionListener {
     override fun onDestroy() {
         isRunning = false
         handler.removeCallbacksAndMessages(null)
+        hibernationHandler.removeCallbacksAndMessages(null)
         resetWakeSequence()
         fullyReleaseRecognizer()
         try { stopForeground(true) } catch (_: Throwable) {}
@@ -135,6 +169,7 @@ class AudioService : Service(), RecognitionListener {
     }
 
     // ---------- Notificações ----------
+
     private fun baseNotification(): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_lock_silent_mode)
@@ -146,9 +181,43 @@ class AudioService : Service(), RecognitionListener {
             .build()
     }
 
+    private fun notifyAudioStateChange(activated: Boolean) {
+        // Texto discreto padrão solicitado
+        val text = if (activated) {
+            "Audio Anjo da Guarda modo ativado"
+        } else {
+            "Audio Anjo da Guarda modo desativado"
+        }
+
+        val notifId = 1002
+        val notif = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_lock_silent_mode)
+            .setContentTitle("Anjo da Guarda")
+            .setContentText(text)
+            .setAutoCancel(true)
+            .setOngoing(false)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+        nm.notify(notifId, notif)
+    }
+
     private fun triggerAlert() {
+        val now = SystemClock.elapsedRealtime()
+        val diff = now - lastAlertAtMs
+        if (diff in 1..MIN_ALERT_INTERVAL_MS) {
+            Log.d(TAG, "Ignorando alerta duplicado (diff=${diff}ms)")
+            return
+        }
+        lastAlertAtMs = now
+
         val title = SpannableString("🚨 SOS").apply {
-            setSpan(StyleSpan(Typeface.BOLD), 2, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(
+                StyleSpan(Typeface.BOLD),
+                2,
+                length,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
         }
         val notif = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
@@ -180,7 +249,162 @@ class AudioService : Service(), RecognitionListener {
         nm.createNotificationChannel(ch)
     }
 
-    // ---------- Carrega senhas de áudio das SharedPreferences ----------
+    // ---------- Controle de hibernação / agenda / áudio ----------
+
+    private fun readBoolCompat(
+        prefs: SharedPreferences,
+        key: String,
+        default: Boolean
+    ): Boolean {
+        val all = prefs.all
+        val raw = all[key] ?: return default
+        return when (raw) {
+            is Boolean -> raw
+            is String -> raw.equals("true", ignoreCase = true) || raw == "1"
+            is Number -> raw.toInt() != 0
+            else -> default
+        }
+    }
+
+    private fun readIntCompat(
+        prefs: SharedPreferences,
+        key: String,
+        default: Int
+    ): Int {
+        val all = prefs.all
+        val raw = all[key] ?: return default
+        return when (raw) {
+            is Int -> raw
+            is Long -> raw.toInt()
+            is Float -> raw.toInt()
+            is Double -> raw.toInt()
+            is String -> raw.toIntOrNull() ?: default
+            else -> default
+        }
+    }
+
+    private fun applyAudioEnabledState(
+        enabled: Boolean,
+        reason: String,
+        hibernationActive: Boolean
+    ) {
+        val prev = lastLogicalAudioEnabled
+        if (prev != null && prev == enabled) {
+            // Nada mudou; não notifica
+            return
+        }
+        lastLogicalAudioEnabled = enabled
+        audioGloballyEnabled = enabled
+
+        Log.d(
+            TAG,
+            "applyAudioEnabledState(enabled=$enabled, hibernationActive=$hibernationActive, reason=$reason)"
+        )
+
+        if (enabled) {
+            if (recognizer == null) {
+                setupRecognizer()
+            }
+            startListening()
+            notifyAudioStateChange(activated = true)
+        } else {
+            stopListening()
+            notifyAudioStateChange(activated = false)
+        }
+    }
+
+    private fun updateHibernationFromPrefsAndApply(reason: String) {
+        val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+
+        // Flag global das Configurações (Settings) para áudio
+        val audioEnabledFlag =
+            readBoolCompat(prefs, "flutter.audioEnabled", true) ||
+            readBoolCompat(prefs, "flutter.audio_enabled", false)
+
+        // Toggle manual da pill "Modo hibernação"
+        val manualHibernation =
+            readBoolCompat(prefs, "flutter.hibernationOn", false) ||
+            readBoolCompat(prefs, "flutter.hibernation_on", false) ||
+            readBoolCompat(prefs, "flutter.hibernationEnabled", false) ||
+            readBoolCompat(prefs, "flutter.hibernation_enabled", false)
+
+        // Agendamento automático (dias + horário)
+        val autoEnabled =
+            readBoolCompat(prefs, "flutter.hibernationAutoEnabled", false) ||
+            readBoolCompat(prefs, "flutter.hibernation_auto_enabled", false)
+
+        var autoHibernation = false
+
+        if (autoEnabled) {
+            val cal = Calendar.getInstance()
+            val hour = cal.get(Calendar.HOUR_OF_DAY)
+            val minute = cal.get(Calendar.MINUTE)
+            val minuteOfDay = hour * 60 + minute
+
+            val dow = cal.get(Calendar.DAY_OF_WEEK) // 1=Sunday .. 7=Saturday
+            val daySuffix = when (dow) {
+                Calendar.MONDAY -> "mon"
+                Calendar.TUESDAY -> "tue"
+                Calendar.WEDNESDAY -> "wed"
+                Calendar.THURSDAY -> "thu"
+                Calendar.FRIDAY -> "fri"
+                Calendar.SATURDAY -> "sat"
+                Calendar.SUNDAY -> "sun"
+                else -> "mon"
+            }
+
+            val dayOn =
+                readBoolCompat(prefs, "flutter.hibernation_${daySuffix}", false) ||
+                readBoolCompat(prefs, "flutter.hibernation${daySuffix.replaceFirstChar { it.uppercase() }}", false)
+
+            if (dayOn) {
+                var startMin = readIntCompat(prefs, "flutter.hibernationStartMinutes", -1)
+                if (startMin < 0) {
+                    startMin = readIntCompat(prefs, "flutter.hibernation_start_minutes", -1)
+                }
+                var endMin = readIntCompat(prefs, "flutter.hibernationEndMinutes", -1)
+                if (endMin < 0) {
+                    endMin = readIntCompat(prefs, "flutter.hibernation_end_minutes", -1)
+                }
+
+                if (startMin >= 0 && endMin >= 0) {
+                    if (startMin == endMin) {
+                        // janela vazia
+                        autoHibernation = false
+                    } else if (endMin > startMin) {
+                        // janela no mesmo dia
+                        autoHibernation = (minuteOfDay in startMin until endMin)
+                    } else {
+                        // janela atravessando meia-noite (ex: 22h–05h)
+                        autoHibernation =
+                            (minuteOfDay >= startMin) || (minuteOfDay < endMin)
+                    }
+                }
+            }
+        }
+
+        val hibernationActive = manualHibernation || autoHibernation
+        val logicalAudioEnabled = audioEnabledFlag && !hibernationActive
+
+        Log.d(
+            TAG,
+            "updateHibernation(reason=$reason) audioEnabledFlag=$audioEnabledFlag " +
+                "manualH=$manualHibernation autoEnabled=$autoEnabled autoH=$autoHibernation " +
+                "=> logicalEnabled=$logicalAudioEnabled"
+        )
+
+        applyAudioEnabledState(logicalAudioEnabled, reason, hibernationActive)
+    }
+
+    // ---------- Reconhecimento de voz ----------
+
+    private fun fullyReleaseRecognizer() {
+        try { recognizer?.cancel() } catch (_: Throwable) {}
+        try { recognizer?.setRecognitionListener(null) } catch (_: Throwable) {}
+        try { recognizer?.destroy() } catch (_: Throwable) {}
+        recognizer = null
+    }
+
     private fun loadAudioTokensFromPrefs() {
         try {
             val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
@@ -204,7 +428,6 @@ class AudioService : Service(), RecognitionListener {
         }
     }
 
-    // ---------- Reconhecimento de voz ----------
     private fun setupRecognizer() {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) return
         recognizer?.destroy()
@@ -212,7 +435,10 @@ class AudioService : Service(), RecognitionListener {
             it.setRecognitionListener(this)
         }
         recIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(
+                RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+            )
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR")
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
@@ -220,6 +446,29 @@ class AudioService : Service(), RecognitionListener {
     }
 
     private fun startListening() {
+        if (!audioGloballyEnabled) {
+            Log.d(TAG, "startListening: abortado porque audioGloballyEnabled=false")
+            return
+        }
+
+        val am = audioManager ?: run {
+            try {
+                audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            } catch (_: Throwable) {}
+            audioManager
+        }
+
+        // Se tiver mídia tocando (YouTube, Spotify, vídeos...), não escuta
+        try {
+            if (am != null && am.isMusicActive) {
+                Log.d(TAG, "Mídia em reprodução; adiando escuta para não interferir")
+                scheduleRestart(3000)
+                return
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Erro ao checar isMusicActive em startListening", t)
+        }
+
         try {
             recognizer?.startListening(recIntent)
         } catch (_: Throwable) {
@@ -232,10 +481,15 @@ class AudioService : Service(), RecognitionListener {
     }
 
     private fun scheduleRestart(delayMs: Long = 800) {
+        if (!audioGloballyEnabled) {
+            Log.d(TAG, "scheduleRestart: abortado porque audioGloballyEnabled=false")
+            return
+        }
         handler.postDelayed({ startListening() }, delayMs)
     }
 
     // ---------- RecognitionListener ----------
+
     override fun onReadyForSpeech(params: Bundle?) {}
     override fun onBeginningOfSpeech() {}
     override fun onRmsChanged(rmsdB: Float) {}
@@ -252,6 +506,24 @@ class AudioService : Service(), RecognitionListener {
     override fun onEvent(eventType: Int, params: Bundle?) {}
 
     private fun handleBundle(bundle: Bundle) {
+        if (!audioGloballyEnabled) {
+            Log.d(TAG, "handleBundle: ignorando porque audioGloballyEnabled=false")
+            return
+        }
+
+        // Se estiver com mídia tocando, não processa para não atrapalhar
+        try {
+            val am = audioManager
+            if (am != null && am.isMusicActive) {
+                Log.d(TAG, "Mídia em reprodução; pausando reconhecimento por alguns segundos")
+                stopListening()
+                scheduleRestart(3000)
+                return
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Erro ao checar isMusicActive em handleBundle", t)
+        }
+
         val list = bundle.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: return
         val heardRaw = list.firstOrNull() ?: return
         val heard = normalize(heardRaw)
@@ -325,7 +597,8 @@ class AudioService : Service(), RecognitionListener {
             .trim()
     }
 
-    // ---------- Helpers de SharedPreferences ----------
+    // ---------- Helpers de SharedPreferences (destinos) ----------
+
     private fun loadTelegramTargetFromPrefs(): String? {
         return try {
             val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
@@ -384,6 +657,7 @@ class AudioService : Service(), RecognitionListener {
     }
 
     // ---------- Texto padrão Meta/Zenvia ----------
+
     private fun buildAlertText(nome: String, lat: Double?, lon: Double?): String {
         return if (lat != null && lon != null) {
             val link = "https://maps.google.com/?q=$lat,$lon"
@@ -406,6 +680,7 @@ Se não puder ajudar, encaminhe às autoridades.
     }
 
     // ---------- Telegram ----------
+
     private fun sendTelegramMessage(texto: String) {
         val token = BuildConfig.TELEGRAM_BOT_TOKEN
 
@@ -489,6 +764,7 @@ Se não puder ajudar, encaminhe às autoridades.
     }
 
     // ---------- SMS / WhatsApp (Zenvia) ----------
+
     private fun sendZenviaSms(nome: String, lat: Double?, lon: Double?) {
         val token = BuildConfig.ZENVIA_TOKEN
         val from = BuildConfig.ZENVIA_SMS_FROM
@@ -555,10 +831,11 @@ Se não puder ajudar, encaminhe às autoridades.
             return
         }
 
-        // Números vindos do layout no formato +5599..., removemos o '+' para WhatsApp
+        // Números vindos do layout no formato +5599..., removemos o '+'
         val tos = loadPhonesFromPrefs("wa")
             .map { it.replace("+", "") }
             .filter { it.isNotBlank() }
+            .distinct()
 
         if (tos.isEmpty()) {
             Log.w(TAG, "sendZenviaWhatsapp: nenhum destinatário configurado para WhatsApp (prefs waTo1/wa_to_1 etc.)")
@@ -590,7 +867,10 @@ Se não puder ajudar, encaminhe às autoridades.
 }
 """.trimIndent()
 
-                    Log.d(TAG, "sendZenviaWhatsapp(template) to=$to link_rastreamento=$linkRastreamento")
+                    Log.d(
+                        TAG,
+                        "sendZenviaWhatsapp(template) to=$to link_rastreamento=$linkRastreamento"
+                    )
 
                     val req = Request.Builder()
                         .url(url)
@@ -611,6 +891,7 @@ Se não puder ajudar, encaminhe às autoridades.
     }
 
     // ---------- E-mail (SendGrid) ----------
+
     private fun sendSendgridEmail(nome: String, lat: Double?, lon: Double?) {
         val apiKey = BuildConfig.SENDGRID_API_KEY
         val fromEmail = BuildConfig.SENDGRID_FROM
@@ -674,6 +955,7 @@ Se não puder ajudar, encaminhe às autoridades.
     }
 
     // ---------- Disparo multi-canal com ou sem localização ----------
+
     private fun sendTelegramAlertWithOptionalLocation() {
         // pega o nome salvo nas SharedPreferences do Flutter
         val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
@@ -713,6 +995,7 @@ Se não puder ajudar, encaminhe às autoridades.
     }
 
     // ---------- Permissão de localização ----------
+
     private fun hasLocationPermission(): Boolean {
         val fine = ContextCompat.checkSelfPermission(
             this,
