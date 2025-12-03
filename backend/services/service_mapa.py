@@ -306,3 +306,169 @@ def central_page() -> HTMLResponse:
     </html>
     """
     return HTMLResponse(html)
+
+def render_tracking_public_html(session_id: str) -> str:
+    """
+    HTML da página pública de rastreamento para celular.
+    Mesmo visual do mapa central (Leaflet + OpenStreetMap simples),
+    atualiza a posição a cada 15 segundos.
+    """
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8">
+    <title>Rastreamento - Anjo da Guarda</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <!-- tudo em tela cheia no celular -->
+    <style>
+      html, body {{
+        height: 100%;
+        margin: 0;
+        padding: 0;
+      }}
+      body {{
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #000;
+        color: #eee;
+      }}
+      .header {{
+        padding: 8px 12px;
+        font-size: 13px;
+        background: #111;
+        border-bottom: 1px solid #333;
+      }}
+      .header strong {{
+        display: block;
+        font-size: 15px;
+        margin-bottom: 2px;
+      }}
+      #info-line {{
+        margin-top: 2px;
+      }}
+      #map {{
+        width: 100%;
+        height: calc(100% - 52px);
+      }}
+    </style>
+
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+</head>
+<body>
+    <div class="header">
+        <strong>Rastreamento - Anjo da Guarda</strong>
+        <div>Rastreamento em tempo quase real</div>
+        <div id="info-line">Carregando sessão...</div>
+    </div>
+
+    <div id="map"></div>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin="">
+    </script>
+
+    <script>
+      const SESSION_ID = "{session_id}";
+
+      const map = L.map('map');
+
+      // Mesmo tile simples da central (OpenStreetMap, sem nome de loja)
+      const tileLayer = L.tileLayer(
+        'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+        {{
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap contributors'
+        }}
+      ).addTo(map);
+
+      let marker = null;
+      let hasFirstFix = false;
+
+      function atualizarMapa() {{
+        fetch('/api/live-track/list')
+          .then(r => r.json())
+          .then(data => {{
+            // a API pode devolver {{sessions: [...]}} ou direto um array
+            const lista = Array.isArray(data) ? data : (data.sessions || []);
+
+            if (!Array.isArray(lista)) {{
+              console.log('Resposta inesperada de /api/live-track/list', data);
+              return;
+            }}
+
+            const sess = lista.find(s => {{
+              const sid = s.id || s.session_id || s.code || s.token;
+              return sid === SESSION_ID;
+            }});
+
+            if (!sess) {{
+              document.getElementById('info-line').textContent =
+                'Sessão não encontrada ou encerrada.';
+              return;
+            }}
+
+            const lat =
+              sess.lat ??
+              sess.latitude ??
+              sess.last_lat ??
+              (sess.last_point && (sess.last_point.lat ?? sess.last_point.latitude));
+
+            const lon =
+              sess.lon ??
+              sess.lng ??
+              sess.longitude ??
+              sess.last_lon ??
+              (sess.last_point && (sess.last_point.lon ?? sess.last_point.lng ?? sess.last_point.longitude));
+
+            if (lat == null || lon == null) {{
+              document.getElementById('info-line').textContent =
+                'Sessão encontrada, mas ainda sem posição.';
+              return;
+            }}
+
+            const ts =
+              sess.ts ||
+              sess.last_ts ||
+              (sess.last_point && (sess.last_point.ts || sess.last_point.time || sess.last_point.created_at)) ||
+              '';
+
+            const nome =
+              sess.display_name ||
+              sess.name ||
+              sess.nome ||
+              sess.phone ||
+              SESSION_ID;
+
+            document.getElementById('info-line').textContent =
+              `Sessão: ${{nome}} — Última atualização: ${{ts}}`;
+
+            const pos = [lat, lon];
+
+            if (!hasFirstFix) {{
+              hasFirstFix = true;
+              map.setView(pos, 18);
+              marker = L.marker(pos).addTo(map);
+            }} else if (marker) {{
+              marker.setLatLng(pos);
+            }}
+          }})
+          .catch(err => {{
+            console.error('Erro ao buscar lista de sessões', err);
+          }});
+      }}
+
+      // primeira carga
+      atualizarMapa();
+      // atualiza a cada 15 segundos
+      setInterval(atualizarMapa, 15000);
+    </script>
+</body>
+</html>
+"""
