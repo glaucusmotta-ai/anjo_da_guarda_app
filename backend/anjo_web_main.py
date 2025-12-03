@@ -24,11 +24,20 @@ from fastapi import HTTPException
 from services.service_mapa import (
     central_page as render_central_page,
     render_tracking_public_html,
+    salvar_ponto_trilha,
+    listar_pontos_trilha,
 )
 
-
-
-
+from services.routes_live_track import (
+    live_track_start_handler,
+    live_track_update_handler,
+    live_track_last_handler,
+    live_track_track_handler,
+    live_track_stop_handler,
+    live_track_list_handler,
+    live_track_delete_handler,
+    api_live_track_points_handler,
+)
 
 
 import html as _html
@@ -229,311 +238,75 @@ def live_track_state(session_id: str):
         "active": bool(data.get("active", True)),
     }
 
-
 @app.post("/api/live-track/start")
 def live_track_start(payload: Dict[str, Any], request: Request):
-    """
-    Inicia uma sessão de live-tracking direto (sem passar pelo /api/sos),
-    usado, por exemplo, pela central.
-    """
-    nome = (str(payload.get("nome") or "").strip() or "contato")
-    phone = (str(payload.get("phone") or "").strip() or "")
-    lat = payload.get("lat")
-    lon = payload.get("lon")
-
-    if lat is None or lon is None:
-        return JSONResponse(
-            status_code=400, content={"ok": False, "reason": "LAT_LON_REQUIRED"}
-        )
-
-    try:
-        lat_f = float(lat)
-        lon_f = float(lon)
-    except Exception:
-        return JSONResponse(
-            status_code=400, content={"ok": False, "reason": "INVALID_COORDS"}
-        )
-
-    now = _now()
-    session_id = secrets.token_urlsafe(10)
-    LIVE_TRACK_SESSIONS[session_id] = {
-        "nome": nome,
-        "phone": phone,
-        "lat": lat_f,
-        "lon": lon_f,
-        "created_at": now,
-        "updated_at": now,
-        "active": True,
-        "track": [{"lat": lat_f, "lon": lon_f, "ts": now}],
-    }
-
-    # Salva o primeiro ponto da trilha no banco
-    try:
-        salvar_ponto_trilha(session_id, lat_f, lon_f, now)
-    except Exception as e:
-        logger.error("[TRACK] erro ao salvar ponto inicial da trilha: %s", e)
-
-    if TRACKING_BASE_URL:
-        base = TRACKING_BASE_URL.rstrip("/")
-    else:
-        base = str(request.base_url).rstrip("/")
-
-    tracking_url = f"{base}/t/{session_id}"
-
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "tracking_url": tracking_url,
-    }
+    return live_track_start_handler(
+        payload=payload,
+        request=request,
+        LIVE_TRACK_SESSIONS=LIVE_TRACK_SESSIONS,
+        _now=_now,
+        salvar_ponto_trilha=salvar_ponto_trilha,
+        logger=logger,
+        tracking_base_url=TRACKING_BASE_URL,
+    )
 
 
 @app.post("/api/live-track/update")
 def live_track_update(payload: Dict[str, Any]):
-    session_id = (str(payload.get("session_id") or payload.get("id") or "")).strip()
-    if not session_id or session_id not in LIVE_TRACK_SESSIONS:
-        return JSONResponse(
-            status_code=404,
-            content={"ok": False, "reason": "SESSION_NOT_FOUND"},
-        )
-
-    session = LIVE_TRACK_SESSIONS[session_id]
-    if not session.get("active", True):
-        return JSONResponse(
-            status_code=410,
-            content={"ok": False, "reason": "SESSION_INACTIVE"},
-        )
-
-    lat = payload.get("lat")
-    lon = payload.get("lon")
-    if lat is None or lon is None:
-        return JSONResponse(
-            status_code=400, content={"ok": False, "reason": "LAT_LON_REQUIRED"}
-        )
-
-    try:
-        lat_f = float(lat)
-        lon_f = float(lon)
-    except Exception:
-        return JSONResponse(
-            status_code=400, content={"ok": False, "reason": "INVALID_COORDS"}
-        )
-
-    now = _now()
-    session["lat"] = lat_f
-    session["lon"] = lon_f
-    session["updated_at"] = now
-
-    track = session.get("track")
-    if not isinstance(track, list):
-        track = []
-    track.append({"lat": lat_f, "lon": lon_f, "ts": now})
-    if len(track) > 500:
-        track.pop(0)
-    session["track"] = track
-
-    # Persiste também no banco para trilha confiável
-    try:
-        salvar_ponto_trilha(session_id, lat_f, lon_f, now)
-    except Exception as e:
-        logger.error("[TRACK] erro ao salvar ponto da trilha no banco: %s", e)
-
-    logger.info(
-        "[TRACK UPDATE] id=%s ts=%s lat=%.7f lon=%.7f n_points=%d",
-        session_id,
-        now,
-        lat_f,
-        lon_f,
-        len(track),
+    return live_track_update_handler(
+        payload=payload,
+        LIVE_TRACK_SESSIONS=LIVE_TRACK_SESSIONS,
+        _now=_now,
+        salvar_ponto_trilha=salvar_ponto_trilha,
+        logger=logger,
     )
-
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "updated_at": now,
-    }
 
 
 @app.get("/api/live-track/last/{session_id}")
 def live_track_last(session_id: str):
-    data = LIVE_TRACK_SESSIONS.get(session_id)
-    if not data:
-        return JSONResponse(
-            status_code=404, content={"ok": False, "reason": "SESSION_NOT_FOUND"}
-        )
-
-    out = {"ok": True, "session_id": session_id}
-    out.update(
-        {
-            "nome": data.get("nome"),
-            "phone": data.get("phone"),
-            "lat": data.get("lat"),
-            "lon": data.get("lon"),
-            "updated_at": data.get("updated_at"),
-            "active": bool(data.get("active", True)),
-        }
-    )
-    return out
+    return live_track_last_handler(session_id, LIVE_TRACK_SESSIONS)
 
 
 @app.get("/api/live-track/track/{session_id}")
 def live_track_track(session_id: str):
-    """
-    Devolve a trilha em memória; se não houver, tenta reconstruir a partir
-    da tabela live_track_points (service_mapa).
-    """
-    data = LIVE_TRACK_SESSIONS.get(session_id)
-
-    if not data:
-        # fallback: tenta carregar do banco
-        try:
-            points = listar_pontos_trilha(session_id)
-        except Exception as e:
-            logger.error("[TRACK] erro ao carregar trilha do banco: %s", e)
-            points = []
-
-        if not points:
-            return JSONResponse(
-                status_code=404,
-                content={"ok": False, "reason": "SESSION_NOT_FOUND"},
-            )
-
-        # Reconstrói sessão mínima em memória a partir do histórico
-        last = points[-1]
-        data = {
-            "nome": "contato",
-            "phone": "",
-            "lat": last["lat"],
-            "lon": last["lon"],
-            "updated_at": last["ts"],
-            "active": True,
-            "track": [
-                {"lat": p["lat"], "lon": p["lon"], "ts": p["ts"]}
-                for p in points
-            ],
-        }
-        LIVE_TRACK_SESSIONS[session_id] = data
-
-    track = data.get("track") or []
-    safe_track = []
-    for p in track:
-        try:
-            lat = float(p.get("lat"))
-            lon = float(p.get("lon"))
-            safe_track.append({"lat": lat, "lon": lon, "ts": p.get("ts")})
-        except Exception:
-            continue
-
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "nome": data.get("nome"),
-        "phone": data.get("phone"),
-        "track": safe_track,
-        "active": bool(data.get("active", True)),
-    }
+    return live_track_track_handler(
+        session_id=session_id,
+        LIVE_TRACK_SESSIONS=LIVE_TRACK_SESSIONS,
+        listar_pontos_trilha=listar_pontos_trilha,
+        logger=logger,
+    )
 
 
 @app.post("/api/live-track/stop")
 def live_track_stop(payload: Dict[str, Any]):
-    sid = (str(payload.get("session_id") or payload.get("id") or "")).strip()
-    if not sid or sid not in LIVE_TRACK_SESSIONS:
-        return JSONResponse(
-            status_code=404,
-            content={"ok": False, "reason": "SESSION_NOT_FOUND"},
-        )
-
-    session = LIVE_TRACK_SESSIONS[sid]
-    session["active"] = False
-    session["stopped_at"] = _now()
-    session["updated_at"] = _now()
-
-    logger.info(
-        "[TRACK] sessão encerrada pelo app id=%s nome=%s",
-        sid,
-        session.get("nome"),
+    return live_track_stop_handler(
+        payload=payload,
+        LIVE_TRACK_SESSIONS=LIVE_TRACK_SESSIONS,
+        _now=_now,
+        logger=logger,
     )
-    return {"ok": True}
 
 
 @app.get("/api/live-track/list")
 def live_track_list():
-    """
-    Lista todas as sessões de rastreamento em memória para a central 24/7.
-    """
-    sessions_out = []
-
-    # Base do link (sempre anjo-track.3g-brasil.com no seu caso)
-    if TRACKING_BASE_URL:
-        base = TRACKING_BASE_URL.rstrip("/")
-    else:
-        base = CFG.public_base_url.rstrip("/")
-
-    now = datetime.utcnow()
-
-    for sid, data in LIVE_TRACK_SESSIONS.items():
-        lat = data.get("lat")
-        lon = data.get("lon")
-        if not _valid_coords(lat, lon):
-            continue
-
-        updated_at = data.get("updated_at")
-
-        # flag que vem da sessão (live-track/stop marca active=False)
-        session_flag = bool(data.get("active", True))
-        active = session_flag
-
-        # só consideramos "ativo" se tiver atualização recente (<= 15 min)
-        if updated_at:
-            try:
-                dt = datetime.fromisoformat(updated_at)
-                age = (now - dt).total_seconds()
-                active = session_flag and (age <= 900)
-            except Exception:
-                active = session_flag
-
-        try:
-            lat_f = float(lat)
-            lon_f = float(lon)
-        except Exception:
-            continue
-
-        sessions_out.append(
-            {
-                "id": sid,
-                "nome": data.get("nome") or "contato",
-                "phone": data.get("phone") or "",
-                "lat": lat_f,
-                "lon": lon_f,
-                "updated_at": updated_at,
-                "active": active,
-                "tracking_url": f"{base}/t/{sid}",
-            }
-        )
-
-    return {"ok": True, "sessions": sessions_out}
+    return live_track_list_handler(
+        LIVE_TRACK_SESSIONS=LIVE_TRACK_SESSIONS,
+        tracking_base_url=TRACKING_BASE_URL,
+        public_base_url=CFG.public_base_url,
+    )
 
 
 @app.delete("/api/live-track/session/{session_id}")
 def live_track_delete(session_id: str):
-    """Remove uma sessão de rastreamento da memória (central 24/7)."""
-    if session_id in LIVE_TRACK_SESSIONS:
-        try:
-            del LIVE_TRACK_SESSIONS[session_id]
-        except KeyError:
-            pass
-        return {"ok": True, "deleted": True}
-    return JSONResponse(
-        status_code=404,
-        content={"ok": False, "reason": "SESSION_NOT_FOUND"},
-    )
+    return live_track_delete_handler(session_id, LIVE_TRACK_SESSIONS)
 
 
 @app.get("/api/live-track/points/{session_id}")
 def api_live_track_points(session_id: str):
-    points = listar_pontos_trilha(session_id)
-    if not points:
-        raise HTTPException(status_code=404, detail="Sessão não encontrada")
-    return JSONResponse({"ok": True, "points": points})
+    return api_live_track_points_handler(
+        session_id=session_id,
+        listar_pontos_trilha=listar_pontos_trilha,
+    )
 
 
 from fastapi import HTTPException

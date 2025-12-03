@@ -1,10 +1,15 @@
 # backend/services/service_mapa.py
 
+import os
+import sqlite3
+from typing import Any, Dict, List
+
 from fastapi.responses import HTMLResponse
 
-def central_page() -> HTMLResponse:
 
-    
+# ========== HTML DA CENTRAL (/central) ==========
+
+def central_page() -> HTMLResponse:
     html = """
     <!DOCTYPE html>
     <html lang="pt-BR">
@@ -236,7 +241,6 @@ def central_page() -> HTMLResponse:
                   { method: "DELETE" }
                 );
                 if (resp.ok) {
-                  // remove item e marcador localmente
                   li.remove();
                   if (markers[id]) {
                     map.removeLayer(markers[id]);
@@ -252,7 +256,6 @@ def central_page() -> HTMLResponse:
             listEl.appendChild(li);
           });
 
-          // remove marcadores de sessões que sumiram
           Object.keys(markers).forEach((id) => {
             if (!seen.has(id)) {
               map.removeLayer(markers[id]);
@@ -306,6 +309,9 @@ def central_page() -> HTMLResponse:
     </html>
     """
     return HTMLResponse(html)
+
+
+# ========== HTML DO RASTREAMENTO PÚBLICO (/t/{session_id}) ==========
 
 def render_tracking_public_html(session_id: str) -> str:
     """
@@ -472,3 +478,54 @@ def render_tracking_public_html(session_id: str) -> str:
 </body>
 </html>
 """
+
+
+# ========== FUNÇÕES DE BANCO PARA A TRILHA ==========
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, "anjo_da_guarda.db")
+
+
+def salvar_ponto_trilha(session_id: str, lat: float, lon: float, ts: str) -> None:
+    """
+    Salva um ponto da trilha na tabela live_track_points.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO live_track_points (session_id, lat, lon, ts)
+            VALUES (?, ?, ?, ?)
+            """,
+            (session_id, lat, lon, ts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def listar_pontos_trilha(session_id: str) -> List[Dict[str, Any]]:
+    """
+    Lista pontos da trilha ordenados por ts (ASC).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT lat, lon, ts
+            FROM live_track_points
+            WHERE session_id = ?
+            ORDER BY ts ASC
+            """,
+            (session_id,),
+        )
+        rows = cur.fetchall()
+        return [
+            {"lat": row["lat"], "lon": row["lon"], "ts": row["ts"]}
+            for row in rows
+        ]
+    finally:
+        conn.close()
