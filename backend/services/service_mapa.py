@@ -482,50 +482,88 @@ def render_tracking_public_html(session_id: str) -> str:
 
 # ========== FUNÇÕES DE BANCO PARA A TRILHA ==========
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(BASE_DIR, "anjo_da_guarda.db")
+# Base deste arquivo: backend/services
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Raiz do projeto: C:\dev\anjo_da_guarda_app
+ROOT_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", ".."))
+
+# Pasta única de dados: C:\dev\anjo_da_guarda_app\data
+DATA_DIR = os.path.join(ROOT_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Banco único do sistema
+DB_PATH = os.path.join(DATA_DIR, "anjo.db")
 
 def salvar_ponto_trilha(session_id: str, lat: float, lon: float, ts: str) -> None:
     """
-    Salva um ponto da trilha na tabela live_track_points.
+    Salva um ponto da trilha no banco.
+    `ts` deve ser um carimbo de tempo em UTC (isoformat).
     """
     conn = sqlite3.connect(DB_PATH)
     try:
-        cur = conn.cursor()
-        cur.execute(
+        conn.execute(
             """
-            INSERT INTO live_track_points (session_id, lat, lon, ts)
+            INSERT INTO live_track_points (
+                session_id,
+                created_at_utc,
+                lat,
+                lon
+            )
             VALUES (?, ?, ?, ?)
             """,
-            (session_id, lat, lon, ts),
+            (session_id, str(ts), float(lat), float(lon)),
         )
         conn.commit()
+    except Exception as e:
+        try:
+            logger.error("[TRACK] erro ao salvar ponto da trilha no banco: %s", e)
+        except Exception:
+            print("[TRACK] erro ao salvar ponto da trilha no banco:", e)
     finally:
         conn.close()
 
 
-def listar_pontos_trilha(session_id: str) -> List[Dict[str, Any]]:
+def listar_pontos_trilha(session_id: str):
     """
-    Lista pontos da trilha ordenados por ts (ASC).
+    Lista os pontos da trilha para a sessão, ordenados por created_at_utc.
+    Retorna uma lista de dicts com chaves: session_id, lat, lon, ts.
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
-        cur = conn.cursor()
-        cur.execute(
+        rows = conn.execute(
             """
-            SELECT lat, lon, ts
+            SELECT
+                session_id,
+                created_at_utc,
+                lat,
+                lon
             FROM live_track_points
             WHERE session_id = ?
-            ORDER BY ts ASC
+            ORDER BY created_at_utc ASC
             """,
             (session_id,),
-        )
-        rows = cur.fetchall()
-        return [
-            {"lat": row["lat"], "lon": row["lon"], "ts": row["ts"]}
-            for row in rows
-        ]
+        ).fetchall()
+
+        pontos = []
+        for r in rows:
+            pontos.append(
+                {
+                    "session_id": r["session_id"],
+                    "lat": r["lat"],
+                    "lon": r["lon"],
+                    # Mantemos a chave "ts" para o restante do código
+                    "ts": r["created_at_utc"],
+                }
+            )
+        return pontos
+    except Exception as e:
+        try:
+            logger.error("[TRACK] erro ao listar pontos da trilha: %s", e)
+        except Exception:
+            print("[TRACK] erro ao listar pontos da trilha:", e)
+        return []
     finally:
         conn.close()
+

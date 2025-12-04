@@ -20,7 +20,6 @@ from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import URLError, HTTPError
 from fastapi import HTTPException
-from fastapi import HTTPException
 from services.service_mapa import (
     central_page as render_central_page,
     render_tracking_public_html,
@@ -39,7 +38,6 @@ from services.routes_live_track import (
     api_live_track_points_handler,
 )
 
-
 import html as _html
 from string import Template
 import logging
@@ -53,6 +51,8 @@ from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from services.metrics import registrar_sos_event
+
 
 # ---------------------------------------------------------
 # Logs + .env
@@ -238,6 +238,7 @@ def live_track_state(session_id: str):
         "active": bool(data.get("active", True)),
     }
 
+
 @app.post("/api/live-track/start")
 def live_track_start(payload: Dict[str, Any], request: Request):
     return live_track_start_handler(
@@ -250,16 +251,46 @@ def live_track_start(payload: Dict[str, Any], request: Request):
         tracking_base_url=TRACKING_BASE_URL,
     )
 
-
 @app.post("/api/live-track/update")
 def live_track_update(payload: Dict[str, Any]):
-    return live_track_update_handler(
-        payload=payload,
-        LIVE_TRACK_SESSIONS=LIVE_TRACK_SESSIONS,
-        _now=_now,
-        salvar_ponto_trilha=salvar_ponto_trilha,
-        logger=logger,
-    )
+    """
+    Wrapper fino para o update do mapa.
+    - Se o handler interno devolver 404 (sessão não encontrada ou payload estranho),
+      convertemos em 200 com ok=False só para não poluir o log com 404.
+    """
+    try:
+        res = live_track_update_handler(
+            payload=payload,
+            LIVE_TRACK_SESSIONS=LIVE_TRACK_SESSIONS,
+            _now=_now,
+            salvar_ponto_trilha=salvar_ponto_trilha,
+            logger=logger,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            logger.warning(
+                "[TRACK UPDATE WRAPPER] sessão não encontrada (HTTPException) para payload=%s - update ignorado",
+                payload,
+            )
+            return JSONResponse(
+                status_code=200,
+                content={"ok": False, "reason": "SESSION_NOT_FOUND"},
+            )
+        # se for outro erro HTTP, deixa estourar normal
+        raise
+
+    # Caso o handler tenha retornado explicitamente um JSONResponse 404
+    if isinstance(res, JSONResponse) and res.status_code == 404:
+        logger.warning(
+            "[TRACK UPDATE WRAPPER] handler retornou 404 para payload=%s - update ignorado",
+            payload,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={"ok": False, "reason": "SESSION_NOT_FOUND"},
+        )
+
+    return res
 
 
 @app.get("/api/live-track/last/{session_id}")
@@ -309,13 +340,7 @@ def api_live_track_points(session_id: str):
     )
 
 
-from fastapi import HTTPException
-from fastapi.responses import HTMLResponse
-
-# ... aqui em cima já deve existir logger, get_db, etc.
-
-
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse  # (mantido; duplicado não quebra)
 
 
 # -----------------------------------------------------
@@ -327,11 +352,10 @@ async def tracking_public(session_id: str):
     return HTMLResponse(content=html)
 
 
-
 @app.get("/central", response_class=HTMLResponse)
 def central_page():
     return render_central_page()
-    
+
 
 # ---------------------------------------------------------
 # DB helpers (SQLite)
@@ -418,7 +442,8 @@ def db_init():
             channel TEXT,
             lat REAL,
             lon REAL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            phone TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_metrics_created_at ON metrics_events(created_at);
         CREATE INDEX IF NOT EXISTS idx_metrics_event_type ON metrics_events(event_type);
@@ -458,7 +483,8 @@ def db_init():
             sent_sms INTEGER,
             sent_whatsapp INTEGER,
             sent_telegram INTEGER,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            phone TEXT
         );
 
         ----------------------------------------------------------------------
@@ -496,10 +522,26 @@ def db_init():
         );
         CREATE INDEX IF NOT EXISTS idx_live_chat ON live_sessions(chat_id);
         CREATE INDEX IF NOT EXISTS idx_live_active ON live_sessions(active);
+
+        ----------------------------------------------------------------------
+        -- TRILHA DO MAPA (live_track_points)
+        ----------------------------------------------------------------------
+        CREATE TABLE IF NOT EXISTS live_track_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            lat REAL NOT NULL,
+            lon REAL NOT NULL,
+            ts TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_live_track_points_session
+            ON live_track_points(session_id);
+        CREATE INDEX IF NOT EXISTS idx_live_track_points_ts
+            ON live_track_points(ts);
         """
         )
 
-        # Migrações idempotentes
+        # Migrações idempotentes (mantidas)
         try:
             con.execute("ALTER TABLE sos_audit ADD COLUMN phone TEXT")
         except Exception:
@@ -533,9 +575,22 @@ def db_init():
                     email_verified INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
-                """
-            )
 
+        ----------------------------------------------------------------------
+        -- PONTOS DE TRILHA (live track do mapa /t/{session_id})
+        ----------------------------------------------------------------------
+        CREATE TABLE IF NOT EXISTS live_track_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            lat REAL NOT NULL,
+            lon REAL NOT NULL,
+            ts TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ltp_session_time
+            ON live_track_points(session_id, ts);
+
+        """
+        )
 
 db_init()
 
@@ -2279,6 +2334,30 @@ async def api_sos(payload: SosIn):
             )
     except Exception as e:
         logger.error("[METRICS] erro ao registrar evento SOS: %s", e)
+
+    # Registro detalhado em sos_events (para dashboards/KPI)
+    try:
+        registrar_sos_event(
+            extra={
+                "user_id": user_id,
+                "phone": phone,
+                "lat": float(lat) if _valid_coords(lat, lon) else None,
+                "lon": float(lon) if _valid_coords(lat, lon) else None,
+                "payload": payload.dict(),
+                "channels": {
+                    "email": sent_email,
+                    "sms": sent_sms,
+                    "whatsapp": sent_whatsapp,
+                    "telegram": sent_telegram,
+                },
+                "tracking": {
+                    "id": tracking_id,
+                    "url": tracking_url,
+                },
+            }
+        )
+    except Exception as e:
+        logger.error("[SOS_EVENTS] erro ao registrar evento detalhado: %s", e)
 
     ok = any([sent_email, sent_sms, sent_whatsapp, sent_telegram])
     return JSONResponse(
