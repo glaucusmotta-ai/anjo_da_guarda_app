@@ -1,10 +1,11 @@
 // lib/screens/settings_screen.dart
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart'; // kDebugMode
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../services/settings_store.dart';
-import '../services/native_sos.dart'; // Testar envios + quickLatLon
+import '../services/native_sos.dart'; // quickLatLon (se quisermos usar depois)
 import '../widgets/user_profile_section.dart';
 import '../theme/anjo_theme.dart';
 
@@ -42,7 +43,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _audioEnabled = true; // liga/desliga disparo por voz
 
   // Telegram
-  final _tgTarget = TextEditingController(); // chat_id numérico OU @username/@canal/@grupo
+  final _tgTarget =
+      TextEditingController(); // chat_id numérico OU @username/@canal/@grupo
 
   // SMS (3 destinatários)
   final _smsTo1 = TextEditingController();
@@ -448,38 +450,41 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _testSends() async {
-    // reseta contador se tiver estourado
+    //  Já usou os 2 testes? Só avisa e sai.
     if (_testCount >= 2) {
-      _testCount = 0;
-      await SettingsStore.instance.setTestCount(0);
-    }
-
-    // pega localização (necessária pro link do mapa do template)
-    final ll = await NativeSos.quickLatLon();
-    final lat = ll.$1, lon = ll.$2;
-    if (lat == null || lon == null) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content:
-              Text('Ative a Localização para o teste (gera o link do mapa).'),
+          content: Text(
+            'Você já usou os 2 testes iniciais. '
+            'Use o botão "Iniciar serviço" para o uso normal.',
+          ),
         ),
       );
       return;
     }
 
-    // incrementa contador e persiste
+    // incrementa contador de testes (créditos) e persiste
     setState(() => _testCount++);
     await SettingsStore.instance.setTestCount(_testCount);
 
-    // texto alinhado ao template (backend/nativo monta o padrão completo)
-    final ok = await NativeSos.send("sos pessoal", lat: lat, lon: lon);
+    // marca flag para uso futuro na Home (se necessário)
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('pendingTestFromSettings', true);
+    } catch (_) {}
 
     if (!mounted) return;
+
+    // vai para a Home; disparo real será pelo botão "Iniciar serviço"
+    Navigator.of(context).pushNamed('/home');
+
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content:
-            Text(ok ? 'Teste enviado (${_testCount}/2)' : 'Falha no envio'),
+        content: Text(
+          'Teste ${_testCount}/2 preparado. '
+          'Na tela inicial, toque em "Iniciar serviço" para disparar o teste.',
+        ),
       ),
     );
   }
@@ -700,7 +705,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
 
-    final testsLeft = 2 - _testCount;
+    // garante que não fica negativo se vier algo zoado do banco
+    final testsLeft = (_testCount >= 2) ? 0 : (2 - _testCount);
 
     return Theme(
       data: theme,
@@ -1023,7 +1029,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                       ]),
 
-                      // Preferências
+                      // Preferências (apenas toggles)
                       _card('Preferências', Icons.tune, [
                         SwitchListTile(
                           value: _pinSecondLayerEnabled,
@@ -1066,33 +1072,92 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             label: const Text('Como ativar o atalho'),
                           ),
                         ),
+                      ]),
+
+                      // Card de salvar configurações (botão fixo)
+                      _card('Salvar configurações', Icons.save_outlined, [
+                        const Text(
+                          'Depois de ajustar os dados e preferências, toque em '
+                          'SALVAR para aplicar tudo e voltar para a tela de PIN.',
+                          style: TextStyle(
+                            color: Colors.white70,
+                            fontSize: 12,
+                          ),
+                        ),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: ElevatedButton.icon(
+                            onPressed: _save,
+                            icon: const Icon(Icons.save),
+                            label: const Text('Salvar'),
+                          ),
+                        ),
+                      ]),
+
+                      // Card de testes (separado das preferências)
+                      _card('Testes (limite 2)', Icons.bolt, [
                         ListTile(
                           contentPadding: EdgeInsets.zero,
                           title: const Text('Testar envios'),
                           subtitle: Text(
                             _testCount < 2
-                                ? 'Você ainda pode fazer $testsLeft teste(s).'
-                                : 'Limite de testes atingido. Use “Iniciar serviço”.',
+                                ? 'Você ainda pode usar $testsLeft teste(s). '
+                                    'Ao tocar em TESTAR, vamos abrir a tela inicial; '
+                                    'o disparo acontece pelo botão "Iniciar serviço".'
+                                : 'Limite de 2 testes atingido. '
+                                    'Use “Iniciar serviço” para testar em produção.',
                             style: const TextStyle(color: Colors.white54),
                           ),
                           trailing: ElevatedButton.icon(
                             onPressed: _testCount >= 2 ? null : _testSends,
-                            icon: const Icon(Icons.bolt),
+                            icon: const Icon(Icons.play_arrow),
                             label: const Text('Testar'),
                           ),
                         ),
+                        const Text(
+                          'Os testes usam o mesmo texto padrão do alerta real, '
+                          'apenas marcados como teste nos controles internos.',
+                          style: TextStyle(
+                            color: Colors.white54,
+                            fontSize: 11,
+                          ),
+                        ),
+
+                        // 🔹 Botão DEV-ONLY para resetar contador de testes (só aparece em debug)
+                        if (kDebugMode)
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: TextButton.icon(
+                              onPressed: () async {
+                                setState(() => _testCount = 0);
+                                await SettingsStore.instance.setTestCount(0);
+                                if (!mounted) return;
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                      '[DEV] Contador de testes reiniciado.',
+                                    ),
+                                  ),
+                                );
+                              },
+                              icon: const Icon(
+                                Icons.restart_alt,
+                                size: 18,
+                                color: Colors.white70,
+                              ),
+                              label: const Text(
+                                '[DEV] Resetar testes',
+                                style: TextStyle(color: Colors.white70),
+                              ),
+                            ),
+                          ),
                       ]),
                     ],
                   ),
                 ),
         ),
-        floatingActionButton: _loading
-            ? null
-            : FloatingActionButton.extended(
-                onPressed: _save,
-                icon: const Icon(Icons.save),
-                label: const Text('Salvar'),
-              ),
+        // botão flutuante removido: agora o SALVAR está em um card próprio
+        floatingActionButton: null,
       ),
     );
   }
