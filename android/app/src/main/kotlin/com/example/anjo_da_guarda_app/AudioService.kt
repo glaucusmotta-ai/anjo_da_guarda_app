@@ -42,7 +42,7 @@ class AudioService : Service(), RecognitionListener {
         private const val CHANNEL_NAME = "Serviço em 1º plano"
         private const val CHANNEL_DESC = "Monitoramento de palavra-chave para SOS"
 
-        // 👉 Template oficial da Meta/Zenvia (mesmo do backend/SosDispatcher)
+        // Template oficial da Meta/Zenvia (mesmo do backend/SosDispatcher)
         private const val ZENVIA_WA_TEMPLATE_ID = "406d05ec-cd3c-4bca-add3-ddd521aef484"
 
         // AÇÃO QUE O NATIVE SOS ESTÁ ENVIANDO (ACTION_STOP_SOS)
@@ -99,6 +99,10 @@ class AudioService : Service(), RecognitionListener {
     // Estado lógico do áudio (depois de hibernação / agenda / toggle geral)
     private var audioGloballyEnabled: Boolean = true
     private var lastLogicalAudioEnabled: Boolean? = null
+
+    // Para sabermos quando a hibernação mudou de ON para OFF (e vice-versa)
+    private var lastHibernationActive: Boolean? = null
+
 
     override fun onCreate() {
         super.onCreate()
@@ -181,15 +185,14 @@ class AudioService : Service(), RecognitionListener {
             .build()
     }
 
-    private fun notifyAudioStateChange(activated: Boolean) {
-        // Texto discreto padrão solicitado
+    private fun notifyHibernationStateChange(activated: Boolean) {
         val text = if (activated) {
-            "Audio Anjo da Guarda modo ativado"
+            "Modo hibernação ativado"
         } else {
-            "Audio Anjo da Guarda modo desativado"
+            "Modo hibernação desativado"
         }
 
-        val notifId = 1002
+        val notifId = 1003
         val notif = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_lock_silent_mode)
             .setContentTitle("Anjo da Guarda")
@@ -256,13 +259,18 @@ class AudioService : Service(), RecognitionListener {
         key: String,
         default: Boolean
     ): Boolean {
-        val all = prefs.all
-        val raw = all[key] ?: return default
-        return when (raw) {
-            is Boolean -> raw
-            is String -> raw.equals("true", ignoreCase = true) || raw == "1"
-            is Number -> raw.toInt() != 0
-            else -> default
+        return try {
+            val all = prefs.all
+            val raw = all[key] ?: return default
+            when (raw) {
+                is Boolean -> raw
+                is String -> raw.equals("true", ignoreCase = true) || raw == "1"
+                is Number -> raw.toInt() != 0
+                else -> default
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Erro ao ler bool compat ($key)", t)
+            default
         }
     }
 
@@ -271,15 +279,20 @@ class AudioService : Service(), RecognitionListener {
         key: String,
         default: Int
     ): Int {
-        val all = prefs.all
-        val raw = all[key] ?: return default
-        return when (raw) {
-            is Int -> raw
-            is Long -> raw.toInt()
-            is Float -> raw.toInt()
-            is Double -> raw.toInt()
-            is String -> raw.toIntOrNull() ?: default
-            else -> default
+        return try {
+            val all = prefs.all
+            val raw = all[key] ?: return default
+            when (raw) {
+                is Int -> raw
+                is Long -> raw.toInt()
+                is Float -> raw.toInt()
+                is Double -> raw.toInt()
+                is String -> raw.toIntOrNull() ?: default
+                else -> default
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Erro ao ler int compat ($key)", t)
+            default
         }
     }
 
@@ -290,7 +303,7 @@ class AudioService : Service(), RecognitionListener {
     ) {
         val prev = lastLogicalAudioEnabled
         if (prev != null && prev == enabled) {
-            // Nada mudou; não notifica
+            // Nada mudou
             return
         }
         lastLogicalAudioEnabled = enabled
@@ -306,91 +319,133 @@ class AudioService : Service(), RecognitionListener {
                 setupRecognizer()
             }
             startListening()
-            notifyAudioStateChange(activated = true)
         } else {
             stopListening()
-            notifyAudioStateChange(activated = false)
         }
     }
 
     private fun updateHibernationFromPrefsAndApply(reason: String) {
         val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
 
-        // Flag global das Configurações (Settings) para áudio
+        // Flag global do áudio (botão principal)
         val audioEnabledFlag =
-            readBoolCompat(prefs, "flutter.audioEnabled", true) ||
-            readBoolCompat(prefs, "flutter.audio_enabled", false)
+            readBoolCompat(prefs, "flutter.audio_enabled", true) ||
+            readBoolCompat(prefs, "flutter.audioEnabled", true)
 
-        // Toggle manual da pill "Modo hibernação"
+        // Botão "Modo hibernação" manual
         val manualHibernation =
-            readBoolCompat(prefs, "flutter.hibernationOn", false) ||
             readBoolCompat(prefs, "flutter.hibernation_on", false) ||
+            readBoolCompat(prefs, "flutter.hibernationOn", false) ||
             readBoolCompat(prefs, "flutter.hibernationEnabled", false) ||
             readBoolCompat(prefs, "flutter.hibernation_enabled", false)
 
-        // Agendamento automático (dias + horário)
-        val autoEnabled =
-            readBoolCompat(prefs, "flutter.hibernationAutoEnabled", false) ||
-            readBoolCompat(prefs, "flutter.hibernation_auto_enabled", false)
+        // Agenda (ON/OFF)
+        val agendaEnabled =
+            readBoolCompat(prefs, "flutter.hib_agenda_enabled", false) ||
+            readBoolCompat(prefs, "flutter.hibernation_auto_enabled", false) ||
+            readBoolCompat(prefs, "flutter.hibAgendaEnabled", false)
 
         var autoHibernation = false
 
-        if (autoEnabled) {
+        if (agendaEnabled) {
             val cal = Calendar.getInstance()
             val hour = cal.get(Calendar.HOUR_OF_DAY)
             val minute = cal.get(Calendar.MINUTE)
             val minuteOfDay = hour * 60 + minute
 
-            val dow = cal.get(Calendar.DAY_OF_WEEK) // 1=Sunday .. 7=Saturday
-            val daySuffix = when (dow) {
-                Calendar.MONDAY -> "mon"
-                Calendar.TUESDAY -> "tue"
-                Calendar.WEDNESDAY -> "wed"
-                Calendar.THURSDAY -> "thu"
-                Calendar.FRIDAY -> "fri"
-                Calendar.SATURDAY -> "sat"
-                Calendar.SUNDAY -> "sun"
-                else -> "mon"
+            val dayNum = cal.get(Calendar.DAY_OF_WEEK) // 1..7 (DOM=1 ... SÁB=7)
+
+            fun dayEnabled(num: Int, alt1: String, alt2: String): Boolean {
+                val keyNum = "flutter.hib_day_$num"
+                return if (prefs.contains(keyNum)) {
+                    readBoolCompat(prefs, keyNum, true)
+                } else {
+                    // se não tiver nada salvo, consideramos LIGADO (true)
+                    val v1 = readBoolCompat(prefs, alt1, true)
+                    val v2 = readBoolCompat(prefs, alt2, true)
+                    v1 || v2
+                }
             }
 
-            val dayOn =
-                readBoolCompat(prefs, "flutter.hibernation_${daySuffix}", false) ||
-                readBoolCompat(prefs, "flutter.hibernation${daySuffix.replaceFirstChar { it.uppercase() }}", false)
+            val dayOn = when (dayNum) {
+                Calendar.SUNDAY    -> dayEnabled(1, "flutter.hibernation_sun", "flutter.hibernationSun")
+                Calendar.MONDAY    -> dayEnabled(2, "flutter.hibernation_mon", "flutter.hibernationMon")
+                Calendar.TUESDAY   -> dayEnabled(3, "flutter.hibernation_tue", "flutter.hibernationTue")
+                Calendar.WEDNESDAY -> dayEnabled(4, "flutter.hibernation_wed", "flutter.hibernationWed")
+                Calendar.THURSDAY  -> dayEnabled(5, "flutter.hibernation_thu", "flutter.hibernationThu")
+                Calendar.FRIDAY    -> dayEnabled(6, "flutter.hibernation_fri", "flutter.hibernationFri")
+                Calendar.SATURDAY  -> dayEnabled(7, "flutter.hibernation_sat", "flutter.hibernationSat")
+                else               -> true
+            }
 
-            if (dayOn) {
-                var startMin = readIntCompat(prefs, "flutter.hibernationStartMinutes", -1)
+            if (!dayOn) {
+                Log.d(
+                    TAG,
+                    "Agenda ligada mas dia atual OFF (num=flutter.hib_day_$dayNum alt=${when(dayNum){
+                        Calendar.SUNDAY    -> "flutter.hibernation_sun/flutter.hibernationSun"
+                        Calendar.MONDAY    -> "flutter.hibernation_mon/flutter.hibernationMon"
+                        Calendar.TUESDAY   -> "flutter.hibernation_tue/flutter.hibernationTue"
+                        Calendar.WEDNESDAY -> "flutter.hibernation_wed/flutter.hibernationWed"
+                        Calendar.THURSDAY  -> "flutter.hibernation_thu/flutter.hibernationThu"
+                        Calendar.FRIDAY    -> "flutter.hibernation_fri/flutter.hibernationFri"
+                        Calendar.SATURDAY  -> "flutter.hibernation_sat/flutter.hibernationSat"
+                        else               -> "desconhecido"
+                    }}"
+                )
+            } else {
+                // início
+                var startMin = readIntCompat(prefs, "flutter.hib_start_min", -1)
+                if (startMin < 0) {
+                    startMin = readIntCompat(prefs, "flutter.hibernationStartMinutes", -1)
+                }
                 if (startMin < 0) {
                     startMin = readIntCompat(prefs, "flutter.hibernation_start_minutes", -1)
                 }
-                var endMin = readIntCompat(prefs, "flutter.hibernationEndMinutes", -1)
+
+                // fim
+                var endMin = readIntCompat(prefs, "flutter.hib_end_min", -1)
+                if (endMin < 0) {
+                    endMin = readIntCompat(prefs, "flutter.hibernationEndMinutes", -1)
+                }
                 if (endMin < 0) {
                     endMin = readIntCompat(prefs, "flutter.hibernation_end_minutes", -1)
                 }
 
                 if (startMin >= 0 && endMin >= 0) {
-                    if (startMin == endMin) {
-                        // janela vazia
-                        autoHibernation = false
-                    } else if (endMin > startMin) {
-                        // janela no mesmo dia
-                        autoHibernation = (minuteOfDay in startMin until endMin)
-                    } else {
-                        // janela atravessando meia-noite (ex: 22h–05h)
-                        autoHibernation =
-                            (minuteOfDay >= startMin) || (minuteOfDay < endMin)
+                    autoHibernation = when {
+                        startMin == endMin -> false
+                        endMin > startMin  -> minuteOfDay in startMin until endMin
+                        else               -> minuteOfDay >= startMin || minuteOfDay < endMin
                     }
+
+                    Log.d(
+                        TAG,
+                        "Agenda ativa (GLOBAL) minuteOfDay=$minuteOfDay startMin=$startMin endMin=$endMin autoH=$autoHibernation"
+                    )
+                } else {
+                    Log.d(
+                        TAG,
+                        "Agenda ligada mas sem horários válidos (startMin=$startMin endMin=$endMin)"
+                    )
                 }
             }
         }
 
+        // --------- RESULTADO FINAL ---------
         val hibernationActive = manualHibernation || autoHibernation
         val logicalAudioEnabled = audioEnabledFlag && !hibernationActive
+
+        // Notificação "Modo hibernação ativado/desativado"
+        if (reason != "onCreate" && lastHibernationActive != hibernationActive) {
+            notifyHibernationStateChange(hibernationActive)
+        }
+        lastHibernationActive = hibernationActive
 
         Log.d(
             TAG,
             "updateHibernation(reason=$reason) audioEnabledFlag=$audioEnabledFlag " +
-                "manualH=$manualHibernation autoEnabled=$autoEnabled autoH=$autoHibernation " +
-                "=> logicalEnabled=$logicalAudioEnabled"
+                    "manualH=$manualHibernation agendaEnabled=$agendaEnabled autoH=$autoHibernation " +
+                    "=> logicalEnabled=$logicalAudioEnabled"
         )
 
         applyAudioEnabledState(logicalAudioEnabled, reason, hibernationActive)
