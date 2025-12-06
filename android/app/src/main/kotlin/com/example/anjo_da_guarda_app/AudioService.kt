@@ -24,6 +24,8 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.media.AudioAttributes
 import com.google.android.gms.location.LocationServices
 import java.text.Normalizer
 import java.util.Calendar
@@ -225,7 +227,7 @@ class AudioService : Service(), RecognitionListener {
             .build()
         nm.notify(NOTIF_ID, notif)
 
-        // Disparo multi-canal centralizado no SosDispatcher (mesmo cérebro do PIN)
+        // Disparo multi-canal centralizado no SosDispatcher
         sendSosViaDispatcherWithOptionalLocation()
     }
 
@@ -419,7 +421,11 @@ class AudioService : Service(), RecognitionListener {
 
         // --------- RESULTADO FINAL ---------
         val hibernationActive = manualHibernation || autoHibernation
-        val logicalAudioEnabled = audioEnabledFlag && !hibernationActive
+
+        // Se houver áudio/mídia de outro app ativo, respeitamos e pausamos o reconhecimento
+        val externalAudioActive = isOtherAudioActive()
+
+        val logicalAudioEnabled = audioEnabledFlag && !hibernationActive && !externalAudioActive
 
         // Notificação "Modo hibernação ativado/desativado"
         if (reason != "onCreate" && lastHibernationActive != hibernationActive) {
@@ -431,7 +437,7 @@ class AudioService : Service(), RecognitionListener {
             TAG,
             "updateHibernation(reason=$reason) audioEnabledFlag=$audioEnabledFlag " +
                     "manualH=$manualHibernation agendaEnabled=$agendaEnabled autoH=$autoHibernation " +
-                    "=> logicalEnabled=$logicalAudioEnabled"
+                    "externalAudioActive=$externalAudioActive => logicalEnabled=$logicalAudioEnabled"
         )
 
         applyAudioEnabledState(logicalAudioEnabled, reason, hibernationActive)
@@ -489,6 +495,12 @@ class AudioService : Service(), RecognitionListener {
     private fun startListening() {
         if (!audioGloballyEnabled) {
             Log.d(TAG, "startListening: abortado porque audioGloballyEnabled=false")
+            return
+        }
+
+        // Se algum outro app estiver usando áudio/música/voz, não abrimos o microfone
+        if (isOtherAudioActive()) {
+            Log.d(TAG, "startListening: bloqueado porque outro áudio está ativo")
             return
         }
 
@@ -674,17 +686,6 @@ class AudioService : Service(), RecognitionListener {
         return result.distinct()
     }
 
-    // ---------- Texto base padrão (sem link; SosDispatcher completa com mapa/tracking) ----------
-
-    private fun buildBaseAlertText(nome: String): String {
-        val clean = nome.ifBlank { "Contato" }
-        return (
-            "🚨 ALERTA de $clean\n" +
-            "Situacao: SOS pessoal\n" +
-            "Se nao puder ajudar, encaminhe as autoridades."
-        ).trim()
-    }
-
     // ---------- Disparo multi-canal via SosDispatcher ----------
 
     private fun sendSosViaDispatcherWithOptionalLocation() {
@@ -694,18 +695,15 @@ class AudioService : Service(), RecognitionListener {
             ?.takeIf { it.isNotBlank() }
             ?: "Contato"
 
-        val baseText = buildBaseAlertText(nome)
+        // Texto base SEM "Localização (mapa)" — o SosDispatcher completa com o link
+        val baseText = "🚨 ALERTA de $nome\n" +
+                "Situacao: SOS pessoal\n" +
+                "Se nao puder ajudar, encaminhe as autoridades."
 
         val tgTarget = loadTelegramTargetFromPrefs()
         val smsTo = loadPhonesFromPrefs("sms")
         val waTo = loadPhonesFromPrefs("wa")
         val emailTo = loadEmailsFromPrefs()
-
-        Log.d(
-            TAG,
-            "sendSosViaDispatcherWithOptionalLocation nome=$nome tgTarget=$tgTarget " +
-                    "smsTo=${smsTo.size} waTo=${waTo.size} emailTo=${emailTo.size}"
-        )
 
         fun fireAll(lat: Double?, lon: Double?) {
             val dispatcher = sosDispatcher ?: SosDispatcher(this).also { sosDispatcher = it }
@@ -721,7 +719,6 @@ class AudioService : Service(), RecognitionListener {
         }
 
         if (!hasLocationPermission()) {
-            Log.d(TAG, "Sem permissão de localização; disparando SOS sem coordenadas (áudio)")
             fireAll(null, null)
             return
         }
@@ -730,15 +727,12 @@ class AudioService : Service(), RecognitionListener {
         fused.lastLocation
             .addOnSuccessListener { loc ->
                 if (loc != null) {
-                    Log.d(TAG, "Localização obtida no áudio: lat=${loc.latitude} lon=${loc.longitude}")
                     fireAll(loc.latitude, loc.longitude)
                 } else {
-                    Log.d(TAG, "lastLocation=null no áudio; disparando SOS sem coordenadas")
                     fireAll(null, null)
                 }
             }
-            .addOnFailureListener { err ->
-                Log.e(TAG, "Erro ao obter localização no áudio; disparando SOS sem coordenadas", err)
+            .addOnFailureListener {
                 fireAll(null, null)
             }
     }
@@ -757,5 +751,50 @@ class AudioService : Service(), RecognitionListener {
         ) == PackageManager.PERMISSION_GRANTED
 
         return fine || coarse
+    }
+
+    // ---------- Detecção de áudio de outros apps (YouTube, chamadas etc.) ----------
+
+    private fun isOtherAudioActive(): Boolean {
+        return try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+            // 1) música/mídia ativa no stream principal
+            val music = am.isMusicActive
+
+            // 2) modo de chamada/VoIP
+            val mode = am.mode
+            val inCallOrVoip =
+                (mode == AudioManager.MODE_IN_CALL || mode == AudioManager.MODE_IN_COMMUNICATION)
+
+            var otherPlayback = false
+
+            // 3) Em versões mais novas, checar reprodução de mídia (podendo ser YouTube/Spotify/etc.)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val configs = am.activePlaybackConfigurations
+                configs?.forEach { cfg ->
+                    val attrs = cfg.audioAttributes
+                    val usage = attrs?.usage ?: 0
+                    val isMediaUsage =
+                        usage == AudioAttributes.USAGE_MEDIA ||
+                        usage == AudioAttributes.USAGE_GAME ||
+                        usage == AudioAttributes.USAGE_ASSISTANT
+
+                    if (isMediaUsage) {
+                        otherPlayback = true
+                    }
+                }
+            }
+
+            val active = music || inCallOrVoip || otherPlayback
+            Log.d(
+                TAG,
+                "isOtherAudioActive: music=$music mode=$mode inCallOrVoip=$inCallOrVoip otherPlayback=$otherPlayback active=$active"
+            )
+            active
+        } catch (t: Throwable) {
+            Log.e(TAG, "Erro ao verificar áudio externo", t)
+            false
+        }
     }
 }
