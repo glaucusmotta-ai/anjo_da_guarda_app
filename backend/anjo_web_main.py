@@ -52,6 +52,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from services.metrics import registrar_sos_event
+from services.service_email import SosEmailRequest, send_sos_email_via_smtp
 
 
 # ---------------------------------------------------------
@@ -250,6 +251,7 @@ def live_track_start(payload: Dict[str, Any], request: Request):
         logger=logger,
         tracking_base_url=TRACKING_BASE_URL,
     )
+
 
 @app.post("/api/live-track/update")
 def live_track_update(payload: Dict[str, Any]):
@@ -1939,6 +1941,32 @@ def ping():
 @app.get("/api/health")
 def health():
     return {"ok": True, "ts": _now()}
+
+
+# ---------------------------------------------------------
+# E-mail SOS dedicado (app -> backend -> SMTP)
+# ---------------------------------------------------------
+@app.post("/api/email-sos")
+def api_email_sos(payload: SosEmailRequest):
+    """
+    Endpoint enxuto para o app disparar e-mail de SOS via backend,
+    usando o serviço centralizado em services.service_email.
+    """
+    try:
+        res = send_sos_email_via_smtp(payload)
+    except Exception as e:
+        logger.error("[EMAIL_SOS] erro ao enviar: %s", e)
+        raise HTTPException(status_code=500, detail="EMAIL_SOS_SEND_FAILED")
+
+    # Se o serviço retornar um dicionário com 'ok', respeitamos.
+    if isinstance(res, dict):
+        ok = bool(res.get("ok", True))
+        status_code = 200 if ok else 500
+        return JSONResponse(status_code=status_code, content=res)
+
+    # Qualquer outro retorno tratado como booleano simples.
+    ok = bool(res)
+    return JSONResponse(status_code=200 if ok else 500, content={"ok": ok})
 
 
 # ---------------------------------------------------------
