@@ -25,11 +25,6 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import android.content.pm.PackageManager
 import com.google.android.gms.location.LocationServices
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.MediaType.Companion.toMediaType
-import org.json.JSONObject
 import java.text.Normalizer
 import java.util.Calendar
 
@@ -40,9 +35,6 @@ class AudioService : Service(), RecognitionListener {
         private const val CHANNEL_ID = "sos_audio_channel_id"
         private const val CHANNEL_NAME = "Serviço em 1º plano"
         private const val CHANNEL_DESC = "Monitoramento de palavra-chave para SOS"
-
-        // Template oficial da Meta/Zenvia (mesmo do backend/SosDispatcher)
-        private const val ZENVIA_WA_TEMPLATE_ID = "406d05ec-cd3c-4bca-add3-ddd521aef484"
 
         // AÇÃO QUE O NATIVE SOS ESTÁ ENVIANDO (ACTION_STOP_SOS)
         const val ACTION_STOP = "ACTION_STOP_SOS"
@@ -73,10 +65,11 @@ class AudioService : Service(), RecognitionListener {
         }
     }
 
-    // HTTP (Telegram + Zenvia + SendGrid)
-    private val http by lazy { OkHttpClient() }
-    private val jsonMedia = "application/json; charset=utf-8".toMediaType()
+    // Apenas logs / tag
     private val TAG = "AudioService"
+
+    // Dispatcher central de SOS (Telegram + SMS + WhatsApp + E-mail + mapa)
+    private var sosDispatcher: SosDispatcher? = null
 
     // ------------- Senhas de áudio em 2 etapas -------------
     // Se não houver nada salvo, usamos "socorro" -> "anjo"
@@ -100,12 +93,14 @@ class AudioService : Service(), RecognitionListener {
     // Para sabermos quando a hibernação mudou de ON para OFF (e vice-versa)
     private var lastHibernationActive: Boolean? = null
 
-
     override fun onCreate() {
         super.onCreate()
         isRunning = true
         ensureSosChannel()
         nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        // Dispatcher central de SOS (reutiliza o mesmo pipeline do PIN silencioso)
+        sosDispatcher = SosDispatcher(this)
 
         loadAudioTokensFromPrefs()
         setupRecognizer()
@@ -161,6 +156,7 @@ class AudioService : Service(), RecognitionListener {
         hibernationHandler.removeCallbacksAndMessages(null)
         resetWakeSequence()
         fullyReleaseRecognizer()
+        sosDispatcher = null
         try { stopForeground(true) } catch (_: Throwable) {}
         try {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(NOTIF_ID)
@@ -229,8 +225,8 @@ class AudioService : Service(), RecognitionListener {
             .build()
         nm.notify(NOTIF_ID, notif)
 
-        // Disparo multi-canal (Telegram + SMS + WhatsApp + E-mail)
-        sendTelegramAlertWithOptionalLocation()
+        // Disparo multi-canal centralizado no SosDispatcher (mesmo cérebro do PIN)
+        sendSosViaDispatcherWithOptionalLocation()
     }
 
     private fun ensureSosChannel() {
@@ -363,8 +359,6 @@ class AudioService : Service(), RecognitionListener {
                 }
             }
 
-            // Antes: val dayOn = when (dayNum) { ... }
-            // Agora: var dayOn para permitir HOTFIX
             var dayOn = when (dayNum) {
                 Calendar.SUNDAY    -> dayEnabled(1, "flutter.hibernation_sun", "flutter.hibernationSun")
                 Calendar.MONDAY    -> dayEnabled(2, "flutter.hibernation_mon", "flutter.hibernationMon")
@@ -377,8 +371,6 @@ class AudioService : Service(), RecognitionListener {
             }
 
             if (!dayOn) {
-                // HOTFIX: mesmo que hib_day_X esteja salvo como false,
-                // NÃO vamos bloquear a agenda. Forçamos ON.
                 Log.d(
                     TAG,
                     "Agenda ligada mas dia atual OFF (num=flutter.hib_day_$dayNum) — HOTFIX: forçando dia ON para agenda funcionar"
@@ -682,320 +674,54 @@ class AudioService : Service(), RecognitionListener {
         return result.distinct()
     }
 
-    // ---------- Texto padrão Meta/Zenvia ----------
+    // ---------- Texto base padrão (sem link; SosDispatcher completa com mapa/tracking) ----------
 
-    private fun buildAlertText(nome: String, lat: Double?, lon: Double?): String {
-        val titulo = if (nome.isNotBlank()) "ALERTA de $nome" else "ALERTA"
-        val situacao = "Situacao: SOS pessoal"
-        val localizacao = if (lat != null && lon != null) {
-            val link = "https://maps.google.com/?q=$lat,$lon"
-            "Localizacao (mapa): $link"
-        } else {
-            "Localizacao: nao informada"
-        }
-
-        return listOf(titulo, situacao, localizacao)
-            .joinToString("\n")
-            .trim()
+    private fun buildBaseAlertText(nome: String): String {
+        val clean = nome.ifBlank { "Contato" }
+        return (
+            "🚨 ALERTA de $clean\n" +
+            "Situacao: SOS pessoal\n" +
+            "Se nao puder ajudar, encaminhe as autoridades."
+        ).trim()
     }
 
-    // ---------- Telegram ----------
+    // ---------- Disparo multi-canal via SosDispatcher ----------
 
-    private fun sendTelegramMessage(texto: String) {
-        val token = BuildConfig.TELEGRAM_BOT_TOKEN
-
-        val fromPrefs = loadTelegramTargetFromPrefs()
-        val fromBuildConfig = BuildConfig.TELEGRAM_CHAT_ID
-        val chatId = when {
-            !fromPrefs.isNullOrBlank() -> fromPrefs
-            !fromBuildConfig.isBlank()
-                    && fromBuildConfig != "123456789,987654321"
-                    && fromBuildConfig != "<SUBSTITUA_PELO_SEU_CHAT_ID>" -> fromBuildConfig
-            else -> ""
-        }
-
-        val tokenBlank = token.isBlank()
-        val chatBlank = chatId.isBlank()
-        Log.d(TAG, "sendTelegramMessage: tokenBlank=$tokenBlank chatBlank=$chatBlank")
-
-        if (tokenBlank || chatBlank) {
-            Log.w(TAG, "sendTelegramMessage abortado: conferir TELEGRAM_BOT_TOKEN / tgTarget / TELEGRAM_CHAT_ID")
-            return
-        }
-
-        val url = "https://api.telegram.org/bot${token}/sendMessage"
-        val payload = JSONObject().apply {
-            put("chat_id", chatId)
-            put("text", texto)
-            put("parse_mode", "HTML")
-        }.toString().toRequestBody(jsonMedia)
-
-        Thread {
-            try {
-                val req = Request.Builder().url(url).post(payload).build()
-                http.newCall(req).execute().use { resp ->
-                    Log.d(TAG, "sendTelegramMessage HTTP=${resp.code} body=${resp.body?.string()}")
-                }
-            } catch (t: Throwable) {
-                Log.e(TAG, "sendTelegramMessage erro", t)
-            }
-        }.start()
-    }
-
-    private fun sendTelegramLocation(lat: Double, lng: Double) {
-        val token = BuildConfig.TELEGRAM_BOT_TOKEN
-
-        val fromPrefs = loadTelegramTargetFromPrefs()
-        val fromBuildConfig = BuildConfig.TELEGRAM_CHAT_ID
-        val chatId = when {
-            !fromPrefs.isNullOrBlank() -> fromPrefs
-            !fromBuildConfig.isBlank()
-                    && fromBuildConfig != "123456789,987654321"
-                    && fromBuildConfig != "<SUBSTITUA_PELO_SEU_CHAT_ID>" -> fromBuildConfig
-            else -> ""
-        }
-
-        val tokenBlank = token.isBlank()
-        val chatBlank = chatId.isBlank()
-        Log.d(TAG, "sendTelegramLocation: tokenBlank=$tokenBlank chatBlank=$chatBlank")
-
-        if (tokenBlank || chatBlank) {
-            Log.w(TAG, "sendTelegramLocation abortado: conferir TELEGRAM_BOT_TOKEN / tgTarget / TELEGRAM_CHAT_ID")
-            return
-        }
-
-        val url = "https://api.telegram.org/bot${token}/sendLocation"
-        val payload = JSONObject().apply {
-            put("chat_id", chatId)
-            put("latitude", lat)
-            put("longitude", lng)
-        }.toString().toRequestBody(jsonMedia)
-
-        Thread {
-            try {
-                val req = Request.Builder().url(url).post(payload).build()
-                http.newCall(req).execute().use { resp ->
-                    Log.d(TAG, "sendTelegramLocation HTTP=${resp.code}")
-                }
-            } catch (t: Throwable) {
-                Log.e(TAG, "sendTelegramLocation erro", t)
-            }
-        }.start()
-    }
-
-    // ---------- SMS / WhatsApp (Zenvia) ----------
-
-    private fun sendZenviaSms(nome: String, lat: Double?, lon: Double?) {
-        val token = BuildConfig.ZENVIA_TOKEN
-        val from = BuildConfig.ZENVIA_SMS_FROM
-
-        if (token.isBlank() || from.isBlank()) {
-            Log.w(TAG, "sendZenviaSms abortado: ZENVIA_TOKEN ou ZENVIA_SMS_FROM vazios")
-            return
-        }
-
-        val tos = loadPhonesFromPrefs("sms")
-        if (tos.isEmpty()) {
-            Log.w(TAG, "sendZenviaSms: nenhum destinatário configurado para SMS (prefs smsTo1/sms_to_1 etc.)")
-            return
-        }
-
-        val texto = buildAlertText(nome, lat, lon)
-        val url = "https://api.zenvia.com/v2/channels/sms/messages"
-
-        Thread {
-            tos.forEach { to ->
-                try {
-                    val json = """
-{
-  "from": "$from",
-  "to": "$to",
-  "contents": [
-    {
-      "type": "text",
-      "text": ${JSONObject.quote(texto)}
-    }
-  ]
-}
-""".trimIndent()
-
-                    val req = Request.Builder()
-                        .url(url)
-                        .addHeader("X-API-TOKEN", token)
-                        .addHeader("Content-Type", "application/json")
-                        .post(json.toRequestBody(jsonMedia))
-                        .build()
-
-                    http.newCall(req).execute().use { resp ->
-                        Log.d(TAG, "sendZenviaSms to=$to HTTP=${resp.code}")
-                    }
-                } catch (t: Throwable) {
-                    Log.e(TAG, "sendZenviaSms erro para $to", t)
-                }
-            }
-        }.start()
-    }
-
-    private fun sendZenviaWhatsapp(nome: String, lat: Double?, lon: Double?) {
-        val token = BuildConfig.ZENVIA_TOKEN
-        val from = BuildConfig.ZENVIA_WA_FROM
-
-        if (token.isBlank() || from.isBlank()) {
-            Log.w(TAG, "sendZenviaWhatsapp abortado: ZENVIA_TOKEN ou ZENVIA_WA_FROM vazios")
-            return
-        }
-
-        // Template oficial exige link de rastreamento (URL completa)
-        if (lat == null || lon == null) {
-            Log.w(TAG, "sendZenviaWhatsapp abortado: sem lat/lon para usar o template oficial Meta/Zenvia")
-            return
-        }
-
-        // Números vindos do layout no formato +5599..., removemos o '+'
-        val tos = loadPhonesFromPrefs("wa")
-            .map { it.replace("+", "") }
-            .filter { it.isNotBlank() }
-            .distinct()
-
-        if (tos.isEmpty()) {
-            Log.w(TAG, "sendZenviaWhatsapp: nenhum destinatário configurado para WhatsApp (prefs waTo1/wa_to_1 etc.)")
-            return
-        }
-
-        val url = "https://api.zenvia.com/v2/channels/whatsapp/messages"
-
-        // MESMO PADRÃO DO BACKEND: link_rastreamento = "https://maps.google.com/?q=lat,lon"
-        val linkRastreamento = "https://maps.google.com/?q=$lat,$lon"
-
-        Thread {
-            tos.forEach { to ->
-                try {
-                    val json = """
-{
-  "from": "$from",
-  "to": "$to",
-  "contents": [
-    {
-      "type": "template",
-      "templateId": "$ZENVIA_WA_TEMPLATE_ID",
-      "fields": {
-        "nome": ${JSONObject.quote(nome)},
-        "link_rastreamento": ${JSONObject.quote(linkRastreamento)}
-      }
-    }
-  ]
-}
-""".trimIndent()
-
-                    Log.d(
-                        TAG,
-                        "sendZenviaWhatsapp(template) to=$to link_rastreamento=$linkRastreamento"
-                    )
-
-                    val req = Request.Builder()
-                        .url(url)
-                        .addHeader("X-API-TOKEN", token)
-                        .addHeader("Content-Type", "application/json")
-                        .post(json.toRequestBody(jsonMedia))
-                        .build()
-
-                    http.newCall(req).execute().use { resp ->
-                        val bodyStr = resp.body?.string()
-                        Log.d(TAG, "sendZenviaWhatsapp to=$to HTTP=${resp.code} body=$bodyStr")
-                    }
-                } catch (t: Throwable) {
-                    Log.e(TAG, "sendZenviaWhatsapp erro para $to", t)
-                }
-            }
-        }.start()
-    }
-
-    // ---------- E-mail (SendGrid) ----------
-
-    private fun sendSendgridEmail(nome: String, lat: Double?, lon: Double?) {
-        val apiKey = BuildConfig.SENDGRID_API_KEY
-        val fromEmail = BuildConfig.SENDGRID_FROM
-
-        if (apiKey.isBlank() || fromEmail.isBlank()) {
-            Log.w(TAG, "sendSendgridEmail abortado: SENDGRID_API_KEY ou SENDGRID_FROM vazios")
-            return
-        }
-
-        val tos = loadEmailsFromPrefs()
-        if (tos.isEmpty()) {
-            Log.w(TAG, "sendSendgridEmail: nenhum destinatário configurado (prefs emailTo1/email_to_1 etc.)")
-            return
-        }
-
-        val texto = buildAlertText(nome, lat, lon)
-        val subject = "SOS - ALERTA de $nome"
-        val url = "https://api.sendgrid.com/v3/mail/send"
-
-        Thread {
-            tos.forEach { to ->
-                try {
-                    val json = """
-{
-  "personalizations": [
-    {
-      "to": [
-        { "email": ${JSONObject.quote(to)} }
-      ],
-      "subject": ${JSONObject.quote(subject)}
-    }
-  ],
-  "from": {
-    "email": ${JSONObject.quote(fromEmail)},
-    "name": "Anjo da Guarda"
-  },
-  "content": [
-    {
-      "type": "text/plain",
-      "value": ${JSONObject.quote(texto)}
-    }
-  ]
-}
-""".trimIndent()
-
-                    val req = Request.Builder()
-                        .url(url)
-                        .addHeader("Authorization", "Bearer $apiKey")
-                        .addHeader("Content-Type", "application/json")
-                        .post(json.toRequestBody(jsonMedia))
-                        .build()
-
-                    http.newCall(req).execute().use { resp ->
-                        Log.d(TAG, "sendSendgridEmail to=$to HTTP=${resp.code}")
-                    }
-                } catch (t: Throwable) {
-                    Log.e(TAG, "sendSendgridEmail erro para $to", t)
-                }
-            }
-        }.start()
-    }
-
-    // ---------- Disparo multi-canal com ou sem localização ----------
-
-    private fun sendTelegramAlertWithOptionalLocation() {
-        // pega o nome salvo nas SharedPreferences do Flutter
+    private fun sendSosViaDispatcherWithOptionalLocation() {
         val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+
         val nome = prefs.getString("flutter.nomeCompleto", null)
             ?.takeIf { it.isNotBlank() }
-            ?: "nome"
+            ?: "Contato"
+
+        val baseText = buildBaseAlertText(nome)
+
+        val tgTarget = loadTelegramTargetFromPrefs()
+        val smsTo = loadPhonesFromPrefs("sms")
+        val waTo = loadPhonesFromPrefs("wa")
+        val emailTo = loadEmailsFromPrefs()
+
+        Log.d(
+            TAG,
+            "sendSosViaDispatcherWithOptionalLocation nome=$nome tgTarget=$tgTarget " +
+                    "smsTo=${smsTo.size} waTo=${waTo.size} emailTo=${emailTo.size}"
+        )
 
         fun fireAll(lat: Double?, lon: Double?) {
-            val msg = buildAlertText(nome, lat, lon)
-            sendTelegramMessage(msg)
-            sendZenviaSms(nome, lat, lon)
-            sendZenviaWhatsapp(nome, lat, lon)
-            sendSendgridEmail(nome, lat, lon)
-
-            if (lat != null && lon != null) {
-                sendTelegramLocation(lat, lon)
-            }
+            val dispatcher = sosDispatcher ?: SosDispatcher(this).also { sosDispatcher = it }
+            dispatcher.sendAll(
+                text = baseText,
+                lat = lat,
+                lon = lon,
+                tgTarget = tgTarget,
+                smsTo = smsTo,
+                waTo = waTo,
+                emailTo = emailTo
+            )
         }
 
         if (!hasLocationPermission()) {
+            Log.d(TAG, "Sem permissão de localização; disparando SOS sem coordenadas (áudio)")
             fireAll(null, null)
             return
         }
@@ -1004,12 +730,15 @@ class AudioService : Service(), RecognitionListener {
         fused.lastLocation
             .addOnSuccessListener { loc ->
                 if (loc != null) {
+                    Log.d(TAG, "Localização obtida no áudio: lat=${loc.latitude} lon=${loc.longitude}")
                     fireAll(loc.latitude, loc.longitude)
                 } else {
+                    Log.d(TAG, "lastLocation=null no áudio; disparando SOS sem coordenadas")
                     fireAll(null, null)
                 }
             }
-            .addOnFailureListener {
+            .addOnFailureListener { err ->
+                Log.e(TAG, "Erro ao obter localização no áudio; disparando SOS sem coordenadas", err)
                 fireAll(null, null)
             }
     }
