@@ -91,11 +91,11 @@ android {
                 "\"5511961704582\""
             )
 
-            // --- SENDGRID (E-mail) ---
+            // --- SENDGRID (E-mail desativado no app; e-mail fica via backend/Zoho) ---
             buildConfigField(
                 "String",
                 "SENDGRID_API_KEY",
-                "\"SUA_SENDGRID_API_KEY_AQUI\""
+                "\"contato@3g-brasil.comUI\""
             )
             buildConfigField(
                 "String",

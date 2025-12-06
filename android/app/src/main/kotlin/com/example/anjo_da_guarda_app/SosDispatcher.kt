@@ -290,9 +290,9 @@ class SosDispatcher(private val ctx: Context) {
                         "loop update lat=${loc.latitude} lon=${loc.longitude}"
                     )
                     thread {
-                        runCatching {
+                        try {
                             updateLiveTrackInternal(loc.latitude, loc.longitude)
-                        }.onFailure { e ->
+                        } catch (e: Throwable) {
                             Log.e("LIVE_TRACK", "erro updateLiveTrack (loop)", e)
                         }
                     }
@@ -334,8 +334,14 @@ class SosDispatcher(private val ctx: Context) {
     ) {
         // Tudo em segundo plano para não violar StrictMode (NetworkOnMainThread)
         thread {
+            // texto base (sem link)
+            val baseText = text
+
+            // Nome completo para todos os canais que precisam
+            val nomeCompleto = getNomeCompletoFromPrefs() ?: "Contato"
+
             // 1) Tenta iniciar live tracking e pegar o tracking_url
-            val trackingLink = startLiveTrack(text, lat, lon)
+            val trackingLink = startLiveTrack(baseText, lat, lon)
 
             // 1.1) Se conseguiu criar sessão, inicia o loop nativo de updates
             if (trackingLink != null) {
@@ -345,10 +351,11 @@ class SosDispatcher(private val ctx: Context) {
             // 2) Se não vier tracking_url, cai no link tradicional do Google Maps
             val link = trackingLink ?: mapsLink(lat, lon)
 
+            // Texto completo p/ canais que usam texto direto
             val fullText = if (link != null) {
-                "$text\nLocalização (mapa): $link"
+                "$baseText\nLocalização (mapa): $link"
             } else {
-                text
+                baseText
             }
 
             Log.d(
@@ -359,27 +366,46 @@ class SosDispatcher(private val ctx: Context) {
 
             // TELEGRAM
             thread {
-                runCatching { sendTelegram(fullText, tgTarget, lat, lon) }
-                    .onFailure { Log.e("TG", "falha TG", it) }
+                try {
+                    sendTelegram(fullText, tgTarget, lat, lon)
+                } catch (t: Throwable) {
+                    Log.e("TG", "falha TG", t)
+                }
             }
 
             // SMS (Zenvia)
             thread {
-                runCatching { sendZenviaSms(fullText, smsTo) }
-                    .onFailure { Log.e("ZENVIA_SMS", "falha SMS", it) }
+                try {
+                    sendZenviaSms(fullText, smsTo)
+                } catch (t: Throwable) {
+                    Log.e("ZENVIA_SMS", "falha SMS", t)
+                }
             }
 
             // WHATSAPP (Zenvia – usando TEMPLATE aprovado)
             thread {
-                runCatching { sendZenviaWhats(fullText, waTo, link) }
-                    .onFailure { Log.e("ZENVIA_WA", "falha WA geral", it) }
+                try {
+                    sendZenviaWhats(fullText, waTo, link)
+                } catch (t: Throwable) {
+                    Log.e("ZENVIA_WA", "falha WA geral", t)
+                }
             }
 
-            // E-MAIL (SendGrid) - TEMPORARIAMENTE DESLIGADO (para não gerar custo)
-            // thread {
-            //     runCatching { sendEmailSendGrid(fullText, emailTo) }
-            //         .onFailure { Log.e("MAIL", "falha MAIL", it) }
-            // }
+            // E-MAIL – via backend FastAPI (/api/email-sos)
+            thread {
+                try {
+                    val finalTracking = trackingLink ?: link
+                    sendEmailViaBackend(
+                        nomeCompleto,
+                        lat,
+                        lon,
+                        finalTracking,
+                        emailTo
+                    )
+                } catch (t: Throwable) {
+                    Log.e("MAIL_BACKEND", "falha MAIL via backend", t)
+                }
+            }
         }
     }
 
@@ -585,45 +611,60 @@ class SosDispatcher(private val ctx: Context) {
         return "Contato"
     }
 
-    // ---------------- E-mail (SendGrid) ----------------
-    private fun sendEmailSendGrid(msg: String, list: List<String>) {
-        val key = BuildConfig.SENDGRID_API_KEY
-        val from = BuildConfig.SENDGRID_FROM
-        if (key.isBlank() || from.isBlank()) {
-            Log.d("MAIL", "skip MAIL: key/from vazios")
+    // ---------------- E-mail via backend FastAPI ----------------
+    private fun sendEmailViaBackend(
+        msg: String,
+        list: List<String>,
+        trackingLink: String?
+    ) {
+        val baseUrl = liveTrackBaseUrl
+        if (baseUrl.isBlank()) {
+            Log.d("MAIL_BACKEND", "skip MAIL: baseUrl vazio")
             return
         }
-        val tos = list.filter { it.isNotBlank() }
-        if (tos.isEmpty()) {
-            Log.d("MAIL", "skip MAIL: lista vazia")
-            return
+
+        // Mesmo se a lista vier vazia, deixamos o backend decidir o fallback
+        val emails = list.filter { it.isNotBlank() }.map { it.trim() }
+
+        val emailsLog = if (emails.isEmpty()) {
+            "(vazio - backend vai usar fallback do .env)"
+        } else {
+            emails.joinToString()
         }
+        Log.d(
+            "MAIL_BACKEND",
+            "preparando chamada /api/email-sos emails=$emailsLog tracking=$trackingLink"
+        )
 
-        val url = "https://api.sendgrid.com/v3/mail/send"
-        val toArr = JSONArray()
-        tos.forEach { toArr.put(JSONObject().put("email", it)) }
+        val base = baseUrl.trimEnd('/')
+        val url = "$base/api/email-sos"
 
-        val body = JSONObject()
-            .put("from", JSONObject().put("email", from))
-            .put("personalizations", JSONArray().put(JSONObject().put("to", toArr)))
-            .put("subject", "SOS – Anjo da Guarda")
-            .put(
-                "content",
-                JSONArray().put(
-                    JSONObject()
-                        .put("type", "text/plain")
-                        .put("value", msg)
-                )
-            )
-            .toString().toRequestBody(json)
+        try {
+            val toArr = JSONArray()
+            emails.forEach { toArr.put(it) }
 
-        val req = Request.Builder()
-            .url(url)
-            .addHeader("Authorization", "Bearer $key")
-            .addHeader("Content-Type", "application/json")
-            .post(body)
-            .build()
+            val bodyJson = JSONObject()
+                .put("subject", "SOS – Anjo da Guarda")
+                .put("text", msg)
+                .put("to_list", toArr)
 
-        http.newCall(req).execute().use { logResp("MAIL", it) }
+            if (!trackingLink.isNullOrBlank()) {
+                bodyJson.put("tracking_url", trackingLink)
+            }
+
+            val reqBody = bodyJson.toString().toRequestBody(json)
+
+            val req = Request.Builder()
+                .url(url)
+                .post(reqBody)
+                .build()
+
+            http.newCall(req).execute().use { resp ->
+                val rawBody = resp.body?.string()?.take(400) ?: ""
+                Log.d("MAIL_BACKEND", "HTTP ${resp.code} :: $rawBody")
+            }
+        } catch (t: Throwable) {
+            Log.e("MAIL_BACKEND", "erro ao enviar e-mail via backend", t)
+        }
     }
-}
+

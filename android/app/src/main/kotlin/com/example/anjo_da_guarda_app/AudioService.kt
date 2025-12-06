@@ -8,7 +8,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Typeface
-import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -74,8 +73,6 @@ class AudioService : Service(), RecognitionListener {
         }
     }
 
-    private var audioManager: AudioManager? = null
-
     // HTTP (Telegram + Zenvia + SendGrid)
     private val http by lazy { OkHttpClient() }
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
@@ -109,7 +106,6 @@ class AudioService : Service(), RecognitionListener {
         isRunning = true
         ensureSosChannel()
         nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         loadAudioTokensFromPrefs()
         setupRecognizer()
@@ -367,7 +363,9 @@ class AudioService : Service(), RecognitionListener {
                 }
             }
 
-            val dayOn = when (dayNum) {
+            // Antes: val dayOn = when (dayNum) { ... }
+            // Agora: var dayOn para permitir HOTFIX
+            var dayOn = when (dayNum) {
                 Calendar.SUNDAY    -> dayEnabled(1, "flutter.hibernation_sun", "flutter.hibernationSun")
                 Calendar.MONDAY    -> dayEnabled(2, "flutter.hibernation_mon", "flutter.hibernationMon")
                 Calendar.TUESDAY   -> dayEnabled(3, "flutter.hibernation_tue", "flutter.hibernationTue")
@@ -379,20 +377,16 @@ class AudioService : Service(), RecognitionListener {
             }
 
             if (!dayOn) {
+                // HOTFIX: mesmo que hib_day_X esteja salvo como false,
+                // NÃO vamos bloquear a agenda. Forçamos ON.
                 Log.d(
                     TAG,
-                    "Agenda ligada mas dia atual OFF (num=flutter.hib_day_$dayNum alt=${when(dayNum){
-                        Calendar.SUNDAY    -> "flutter.hibernation_sun/flutter.hibernationSun"
-                        Calendar.MONDAY    -> "flutter.hibernation_mon/flutter.hibernationMon"
-                        Calendar.TUESDAY   -> "flutter.hibernation_tue/flutter.hibernationTue"
-                        Calendar.WEDNESDAY -> "flutter.hibernation_wed/flutter.hibernationWed"
-                        Calendar.THURSDAY  -> "flutter.hibernation_thu/flutter.hibernationThu"
-                        Calendar.FRIDAY    -> "flutter.hibernation_fri/flutter.hibernationFri"
-                        Calendar.SATURDAY  -> "flutter.hibernation_sat/flutter.hibernationSat"
-                        else               -> "desconhecido"
-                    }}"
+                    "Agenda ligada mas dia atual OFF (num=flutter.hib_day_$dayNum) — HOTFIX: forçando dia ON para agenda funcionar"
                 )
-            } else {
+                dayOn = true
+            }
+
+            if (dayOn) {
                 // início
                 var startMin = readIntCompat(prefs, "flutter.hib_start_min", -1)
                 if (startMin < 0) {
@@ -506,27 +500,10 @@ class AudioService : Service(), RecognitionListener {
             return
         }
 
-        val am = audioManager ?: run {
-            try {
-                audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            } catch (_: Throwable) {}
-            audioManager
-        }
-
-        // Se tiver mídia tocando (YouTube, Spotify, vídeos...), não escuta
-        try {
-            if (am != null && am.isMusicActive) {
-                Log.d(TAG, "Mídia em reprodução; adiando escuta para não interferir")
-                scheduleRestart(3000)
-                return
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "Erro ao checar isMusicActive em startListening", t)
-        }
-
         try {
             recognizer?.startListening(recIntent)
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            Log.e(TAG, "startListening falhou, agendando retry", t)
             scheduleRestart()
         }
     }
@@ -550,33 +527,27 @@ class AudioService : Service(), RecognitionListener {
     override fun onRmsChanged(rmsdB: Float) {}
     override fun onBufferReceived(buffer: ByteArray?) {}
     override fun onEndOfSpeech() {}
-    override fun onError(error: Int) { scheduleRestart(1000) }
+
+    override fun onError(error: Int) {
+        Log.e(TAG, "onError code=$error; agendando restart")
+        scheduleRestart(1000)
+    }
 
     override fun onResults(results: Bundle) {
         handleBundle(results)
         scheduleRestart(400)
     }
 
-    override fun onPartialResults(partialResults: Bundle) { handleBundle(partialResults) }
+    override fun onPartialResults(partialResults: Bundle) {
+        handleBundle(partialResults)
+    }
+
     override fun onEvent(eventType: Int, params: Bundle?) {}
 
     private fun handleBundle(bundle: Bundle) {
         if (!audioGloballyEnabled) {
             Log.d(TAG, "handleBundle: ignorando porque audioGloballyEnabled=false")
             return
-        }
-
-        // Se estiver com mídia tocando, não processa para não atrapalhar
-        try {
-            val am = audioManager
-            if (am != null && am.isMusicActive) {
-                Log.d(TAG, "Mídia em reprodução; pausando reconhecimento por alguns segundos")
-                stopListening()
-                scheduleRestart(3000)
-                return
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "Erro ao checar isMusicActive em handleBundle", t)
         }
 
         val list = bundle.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: return
@@ -714,24 +685,18 @@ class AudioService : Service(), RecognitionListener {
     // ---------- Texto padrão Meta/Zenvia ----------
 
     private fun buildAlertText(nome: String, lat: Double?, lon: Double?): String {
-        return if (lat != null && lon != null) {
+        val titulo = if (nome.isNotBlank()) "ALERTA de $nome" else "ALERTA"
+        val situacao = "Situacao: SOS pessoal"
+        val localizacao = if (lat != null && lon != null) {
             val link = "https://maps.google.com/?q=$lat,$lon"
-            """
-🚨 ALERTA de $nome
-Situação: sos pessoal
-Localização (mapa): $link
-
-Se não puder ajudar, encaminhe às autoridades.
-""".trimIndent()
+            "Localizacao (mapa): $link"
         } else {
-            """
-🚨 ALERTA de $nome
-Situação: sos pessoal
-Localização: não informada
-
-Se não puder ajudar, encaminhe às autoridades.
-""".trimIndent()
+            "Localizacao: nao informada"
         }
+
+        return listOf(titulo, situacao, localizacao)
+            .joinToString("\n")
+            .trim()
     }
 
     // ---------- Telegram ----------
