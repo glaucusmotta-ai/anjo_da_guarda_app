@@ -12,21 +12,49 @@ import json
 import time
 import re
 import socket
+import io
+import csv
 from datetime import datetime, timedelta
 from email.message import EmailMessage
-from typing import Optional, Dict, Any, List, Tuple
 from email.utils import formataddr, formatdate
+from string import Template
+from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import URLError, HTTPError
-from fastapi import HTTPException
+import html as _html
+import logging
+
+import requests
+import urllib3.util.connection as urllib3_cn
+from dotenv import load_dotenv
+
+from fastapi import (
+    FastAPI,
+    Request,
+    Form,
+    BackgroundTasks,
+    HTTPException,
+    Query,
+)
+from fastapi.responses import (
+    JSONResponse,
+    HTMLResponse,
+    RedirectResponse,
+    PlainTextResponse,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from services.metrics import registrar_sos_event
+from services.service_email import SosEmailRequest, send_sos_email_via_smtp
 from services.service_mapa import (
     central_page as render_central_page,
     render_tracking_public_html,
     salvar_ponto_trilha,
     listar_pontos_trilha,
 )
-
 from services.routes_live_track import (
     live_track_start_handler,
     live_track_update_handler,
@@ -37,22 +65,47 @@ from services.routes_live_track import (
     live_track_delete_handler,
     api_live_track_points_handler,
 )
+from services.service_assinaturas import (
+    registrar_assinatura_site,
+    listar_assinaturas_debug,
+    listar_comissoes_por_vendedor,
+)
+from services.vendedor_comissao import (
+    listar_comissoes_por_vendedor,
+    resumir_comissoes_por_vendedor,
+)
 
-import html as _html
-from string import Template
-import logging
 
-import requests
-import urllib3.util.connection as urllib3_cn
-from dotenv import load_dotenv
+from services.service_email_assinatura import enviar_email_boas_vindas_assinatura
 
-from fastapi import FastAPI, Request, Form, BackgroundTasks
-from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from services.metrics import registrar_sos_event
-from services.service_email import SosEmailRequest, send_sos_email_via_smtp
+
+ASSINATURAS_DEBUG_TOKEN = os.getenv("ASSINATURAS_DEBUG_TOKEN")
+
+def _check_debug_token(token: str) -> None:
+    """
+    Valida o token interno para acesso aos endpoints de DEBUG/relatórios
+    de assinaturas e comissões.
+    """
+    if not ASSINATURAS_DEBUG_TOKEN:
+        # Token não configurado no .env
+        raise HTTPException(status_code=401, detail="Token interno não configurado.")
+
+    if token != ASSINATURAS_DEBUG_TOKEN:
+        # Token errado
+        raise HTTPException(status_code=401, detail="Não autorizado.")
+
+
+# ---------------------------------------------------------
+# Assinaturas
+# ---------------------------------------------------------
+class AssinaturaSiteIn(BaseModel):
+    user_email: str
+    plano: str
+    valor_mensal_centavos: int
+
+    # opcional: só vem preenchido quando for venda via vendedor
+    desconto_centavos: int | None = 0
+    vendedor_email: str | None = None
 
 
 # ---------------------------------------------------------
@@ -340,6 +393,235 @@ def api_live_track_points(session_id: str):
         session_id=session_id,
         listar_pontos_trilha=listar_pontos_trilha,
     )
+
+
+@app.post("/api/assinaturas/site", tags=["assinaturas"], summary="Api Assinatura Site")
+async def api_assinatura_site(body: AssinaturaSiteIn):
+    novo_id = registrar_assinatura_site(
+        user_email=body.user_email,
+        plano=body.plano,
+        valor_mensal_centavos=body.valor_mensal_centavos,
+        desconto_centavos=body.desconto_centavos or 0,
+        vendedor_email=body.vendedor_email,
+        # percentual_comissao fica no default (0.05 = 5%)
+    )
+
+    enviar_email_boas_vindas_assinatura(body.user_email, body.plano)
+    return {"id": novo_id}
+
+
+
+ASSINATURAS_DEBUG_TOKEN = os.getenv("ASSINATURAS_DEBUG_TOKEN", "")
+
+
+@app.get("/api/assinaturas/debug")
+def listar_assinaturas_debug_endpoint(
+    token: str = Query(..., description="Token interno de acesso"),
+):
+    """
+    Endpoint interno para listar assinaturas em JSON.
+    Protegido por token simples via querystring.
+    """
+    if (not ASSINATURAS_DEBUG_TOKEN) or (token != ASSINATURAS_DEBUG_TOKEN):
+        raise HTTPException(status_code=401, detail="Não autorizado.")
+
+    items = listar_assinaturas_debug(limit=500)
+    return {"items": items}
+
+
+@app.get(
+    "/api/assinaturas/debug/csv",
+    response_class=PlainTextResponse,
+    summary="(Interno) Exportar assinaturas em CSV",
+    tags=["assinaturas-debug"],
+)
+async def assinaturas_debug_csv(
+    token: str = Query(..., description="Token interno de acesso"),
+):
+    # 1) Valida token interno (não mostrar isso para cliente)
+    expected = os.getenv("ASSINATURAS_DEBUG_TOKEN", "")
+    if not expected or token != expected:
+        raise HTTPException(status_code=401, detail="Não autorizado.")
+
+    # 2) Reaproveita a mesma função que já funciona no JSON
+    rows = listar_assinaturas_debug()  # retorna lista de dicts
+
+    # 3) Monta CSV em memória
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=";")
+
+    # Cabeçalho
+    writer.writerow(
+        [
+            "id",
+            "user_email",
+            "plano",
+            "valor_mensal_centavos",
+            "status",
+            "origem",
+            "billing_provider",
+            "external_id",
+            "data_inicio_utc",
+            "data_prox_cobranca_utc",
+            "data_cancelamento_utc",
+            "created_at_utc",
+            "updated_at_utc",
+        ]
+    )
+
+    # Linhas
+    for r in rows:
+        writer.writerow(
+            [
+                r.get("id", ""),
+                r.get("user_email", ""),
+                r.get("plano", ""),
+                r.get("valor_mensal_centavos", ""),
+                r.get("status", ""),
+                r.get("origem", ""),
+                r.get("billing_provider", ""),
+                r.get("external_id", ""),
+                r.get("data_inicio_utc", ""),
+                r.get("data_prox_cobranca_utc", ""),
+                r.get("data_cancelamento_utc", ""),
+                r.get("created_at_utc", ""),
+                r.get("updated_at_utc", ""),
+            ]
+        )
+
+    csv_text = output.getvalue()
+    output.close()
+
+    # 4) Devolve como download
+    return PlainTextResponse(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="assinaturas_debug.csv"'
+        },
+    )
+
+
+@app.get(
+    "/api/assinaturas/comissoes",
+    tags=["assinaturas"],
+    summary="Resumo de comissões por vendedor (interno)",
+)
+async def assinaturas_comissoes_por_vendedor(
+    token: str = Query(..., description="Token interno de acesso"),
+    vendedor_email: str = Query(..., description="E-mail do vendedor (login corporativo)"),
+):
+    """
+    Endpoint interno para consultar comissões de UM vendedor.
+
+    Uso:
+      GET /api/assinaturas/comissoes?token=DEBUG123&vendedor_email=vendedor1@3g-brasil.com
+
+    - Protegido por token interno (ASSINATURAS_DEBUG_TOKEN).
+    - Futuro: amarrar isso ao login real do vendedor.
+    """
+    if not ASSINATURAS_DEBUG_TOKEN or token != ASSINATURAS_DEBUG_TOKEN:
+        raise HTTPException(status_code=401, detail="Não autorizado.")
+
+    data = listar_comissoes_por_vendedor(vendedor_email=vendedor_email)
+    return data
+
+
+@app.get(
+    "/api/assinaturas/comissoes/csv",
+    summary="(DEBUG) Exportar comissões de um vendedor em CSV",
+)
+async def assinaturas_comissoes_csv(
+    token: str = Query(..., description="Token interno de acesso"),
+    vendedor_email: str = Query(..., description="E-mail do vendedor"),
+):
+    # Valida token interno (mesmo esquema do /api/assinaturas/debug)
+    _check_debug_token(token)
+
+    # Busca as assinaturas desse vendedor
+    rows = listar_comissoes_por_vendedor(vendedor_email)
+
+    # Prepara CSV em memória
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=";")
+
+    # Cabeçalho
+    writer.writerow([
+        "id",
+        "user_email",
+        "plano",
+        "vendedor_email",
+        "valor_bruto_centavos",
+        "desconto_centavos",
+        "valor_liquido_centavos",
+        "comissao_centavos",
+        "status",
+        "data_inicio_utc",
+        "created_at_utc",
+    ])
+
+    total_bruto = 0
+    total_desc = 0
+    total_liq = 0
+    total_com = 0
+
+    for row in rows:
+        # Garante que não quebra se faltar algum campo
+        valor_bruto = int(row.get("valor_mensal_centavos", 0) or 0)
+        desconto = int(row.get("desconto_centavos", 0) or 0)
+        # se não tiver salvo valor_liquido, calcula bruto - desconto
+        valor_liq = int(row.get("valor_liquido_centavos", valor_bruto - desconto) or 0)
+        comissao = int(row.get("comissao_centavos", 0) or 0)
+
+        total_bruto += valor_bruto
+        total_desc += desconto
+        total_liq += valor_liq
+        total_com += comissao
+
+        writer.writerow([
+            row.get("id", ""),
+            row.get("user_email", ""),
+            row.get("plano", ""),
+            row.get("vendedor_email", ""),
+            valor_bruto,
+            desconto,
+            valor_liq,
+            comissao,
+            row.get("status", ""),
+            row.get("data_inicio_utc", ""),
+            row.get("created_at_utc", ""),
+        ])
+
+    # Linha de totais
+    writer.writerow([
+        "TOTAL",
+        "",
+        "",
+        vendedor_email,
+        total_bruto,
+        total_desc,
+        total_liq,
+        total_com,
+        "",
+        "",
+        "",
+    ])
+
+    csv_content = output.getvalue()
+
+    # Nome “seguro” pro arquivo (sem @ e .)
+    safe_email = vendedor_email.replace("@", "_").replace(".", "_")
+    filename = f"comissoes_{safe_email}.csv"
+
+    return PlainTextResponse(
+        content=csv_content,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
+    )
+
+
 
 
 from fastapi.responses import HTMLResponse  # (mantido; duplicado não quebra)
