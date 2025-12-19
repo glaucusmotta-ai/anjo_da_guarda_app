@@ -2,9 +2,12 @@
 
 import os
 import sqlite3
-from typing import Any, Dict, List
+import logging
+from typing import List
 
 from fastapi.responses import HTMLResponse
+
+logger = logging.getLogger(__name__)
 
 
 # ========== HTML DA CENTRAL (/central) ==========
@@ -26,9 +29,7 @@ def central_page() -> HTMLResponse:
       />
 
       <style>
-        * {
-          box-sizing: border-box;
-        }
+        * { box-sizing: border-box; }
         body {
           margin: 0;
           font-family: Arial, sans-serif;
@@ -42,17 +43,9 @@ def central_page() -> HTMLResponse:
           line-height: 1.4;
           border-bottom: 1px solid #333;
         }
-        #title {
-          font-weight: bold;
-        }
-        #status {
-          font-size: 12px;
-          opacity: 0.8;
-        }
-        #actions {
-          margin-top: 4px;
-          font-size: 12px;
-        }
+        #title { font-weight: bold; }
+        #status { font-size: 12px; opacity: 0.8; }
+        #actions { margin-top: 4px; font-size: 12px; }
         .btn {
           display: inline-block;
           padding: 4px 8px;
@@ -63,16 +56,9 @@ def central_page() -> HTMLResponse:
           color: #fff;
           cursor: pointer;
         }
-        .btn:hover {
-          background: #333;
-        }
-        #container {
-          display: flex;
-          height: calc(100vh - 72px);
-        }
-        #map {
-          flex: 2;
-        }
+        .btn:hover { background: #333; }
+        #container { display: flex; height: calc(100vh - 72px); }
+        #map { flex: 2; }
         #sidebar {
           flex: 1;
           max-width: 360px;
@@ -81,11 +67,7 @@ def central_page() -> HTMLResponse:
           padding: 8px 12px;
           overflow-y: auto;
         }
-        #sidebar h3 {
-          margin-top: 4px;
-          margin-bottom: 8px;
-          font-size: 14px;
-        }
+        #sidebar h3 { margin-top: 4px; margin-bottom: 8px; font-size: 14px; }
         #sessions-list {
           list-style: none;
           padding: 0;
@@ -97,21 +79,15 @@ def central_page() -> HTMLResponse:
           border-bottom: 1px solid #222;
           cursor: pointer;
         }
-        #sessions-list li:hover {
-          background: #222;
-        }
-        #sessions-list small {
-          color: #aaa;
-        }
+        #sessions-list li:hover { background: #222; }
+        #sessions-list small { color: #aaa; }
         #sessions-list a.encerrar {
           color: #f66;
           font-size: 11px;
           margin-left: 6px;
           text-decoration: none;
         }
-        #sessions-list a.encerrar:hover {
-          text-decoration: underline;
-        }
+        #sessions-list a.encerrar:hover { text-decoration: underline; }
       </style>
     </head>
     <body>
@@ -146,6 +122,51 @@ def central_page() -> HTMLResponse:
 
         let map = L.map("map").setView([-14.2350, -51.9253], 4);
 
+        function normalizeIsoTs(tsRaw) {
+          let iso = String(tsRaw || "").trim();
+          if (!iso) return "";
+
+          // "2025-12-16 21:44:20" -> "2025-12-16T21:44:20"
+          if (iso.indexOf("T") === -1 && iso.indexOf(" ") !== -1) {
+            iso = iso.replace(" ", "T");
+          }
+
+          // corta microssegundos para milissegundos: .593255 -> .593
+          iso = iso.replace(/(\\.[0-9]{3})[0-9]+/, "$1");
+
+          // se não terminar com Z ou offset, assume UTC e adiciona Z
+          if (!/(Z|[+\\-][0-9]{2}:?[0-9]{2})$/i.test(iso)) {
+            iso = iso + "Z";
+          }
+          return iso;
+        }
+
+        function formatTsToLocal(tsRaw) {
+          if (!tsRaw) return "";
+          try {
+            const iso = normalizeIsoTs(tsRaw);
+            if (!iso) return "";
+
+            const d = new Date(iso);
+            if (isNaN(d.getTime())) {
+              return tsRaw;
+            }
+
+            return d.toLocaleString("pt-BR", {
+              timeZone: "America/Sao_Paulo",
+              year: "numeric",
+              month: "2-digit",
+              day: "2-digit",
+              hour: "2-digit",
+              minute: "2-digit",
+              second: "2-digit",
+            });
+          } catch (e) {
+            console.error("Erro ao converter data:", e);
+            return tsRaw;
+          }
+        }
+
         let sidebarVisible = true;
         btnToggleSidebar.onclick = () => {
           sidebarVisible = !sidebarVisible;
@@ -156,9 +177,7 @@ def central_page() -> HTMLResponse:
             sidebar.style.display = "none";
             btnToggleSidebar.textContent = "Mostrar lista";
           }
-          setTimeout(() => {
-            map.invalidateSize();
-          }, 200);
+          setTimeout(() => { map.invalidateSize(); }, 200);
         };
 
         L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -170,9 +189,7 @@ def central_page() -> HTMLResponse:
         let autoFit = true;
         let lastCoordsAll = [];
 
-        map.on("movestart", () => {
-          autoFit = false;
-        });
+        map.on("movestart", () => { autoFit = false; });
 
         function updateSessions(sessions) {
           const seen = new Set();
@@ -180,9 +197,8 @@ def central_page() -> HTMLResponse:
           listEl.innerHTML = "";
 
           sessions.forEach((s) => {
-            if (typeof s.lat !== "number" || typeof s.lon !== "number") {
-              return;
-            }
+            if (typeof s.lat !== "number" || typeof s.lon !== "number") return;
+
             const id = s.id;
             seen.add(id);
             coordsAll.push([s.lat, s.lon]);
@@ -190,14 +206,15 @@ def central_page() -> HTMLResponse:
             let marker = markers[id];
             const nome = s.nome || "contato";
             const phone = s.phone || "";
-            const last = s.updated_at || "";
+            const lastRaw = s.updated_at || "";
+            const lastLocal = formatTsToLocal(lastRaw);
             const active = !!s.active;
             const trackUrl = s.tracking_url || ("/t/" + encodeURIComponent(id));
 
             const popupHtml =
               "<b>" + nome + "</b>" +
               (phone ? "<br/>📱 " + phone : "") +
-              "<br/>⏱ " + last +
+              "<br/>⏱ " + lastLocal +
               "<br/>" +
               (active
                 ? "<span style='color:#0f0;'>Ativo</span>"
@@ -315,9 +332,12 @@ def central_page() -> HTMLResponse:
 
 def render_tracking_public_html(session_id: str) -> str:
     """
-    HTML da página pública de rastreamento para celular.
-    Mesmo visual do mapa central (Leaflet + OpenStreetMap simples),
-    atualiza a posição a cada 15 segundos.
+    HTML da página pública de rastreamento para celular / desktop.
+
+    - Mapa em tela cheia com Leaflet + OSM
+    - Linha azul da trilha
+    - Painel lateral (desktop) / abaixo (mobile) com histórico de pontos
+      (hora local + coordenadas)
     """
     return f"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -326,8 +346,10 @@ def render_tracking_public_html(session_id: str) -> str:
     <title>Rastreamento - Anjo da Guarda</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
 
-    <!-- tudo em tela cheia no celular -->
     <style>
+      * {{
+        box-sizing: border-box;
+      }}
       html, body {{
         height: 100%;
         margin: 0;
@@ -352,9 +374,64 @@ def render_tracking_public_html(session_id: str) -> str:
       #info-line {{
         margin-top: 2px;
       }}
-      #map {{
-        width: 100%;
+
+      /* layout geral: mapa + histórico */
+      #wrapper {{
+        display: flex;
         height: calc(100% - 52px);
+      }}
+      #map {{
+        flex: 2;
+      }}
+      #history-panel {{
+        flex: 1;
+        max-width: 360px;
+        border-left: 1px solid #333;
+        background: #111;
+        padding: 6px 10px;
+        overflow-y: auto;
+        font-size: 12px;
+      }}
+      #history-title {{
+        font-weight: bold;
+        margin-bottom: 4px;
+        font-size: 13px;
+      }}
+      #history-list {{
+        margin: 0;
+        padding: 0;
+      }}
+      .hist-item {{
+        border-bottom: 1px solid #222;
+        padding: 4px 0;
+      }}
+      .hist-item:last-child {{
+        border-bottom: none;
+      }}
+      .hist-time {{
+        color: #ddd;
+      }}
+      .hist-coord {{
+        color: #aaa;
+        font-size: 11px;
+      }}
+      .hist-last {{
+        color: #0f0;
+        font-weight: bold;
+      }}
+
+      /* em telas bem pequenas, coloca o histórico embaixo do mapa */
+      @media (max-width: 768px) {{
+        #wrapper {{
+          flex-direction: column;
+        }}
+        #map {{
+          height: 60%;
+        }}
+        #history-panel {{
+          max-width: 100%;
+          height: 40%;
+        }}
       }}
     </style>
 
@@ -372,7 +449,13 @@ def render_tracking_public_html(session_id: str) -> str:
         <div id="info-line">Carregando sessão...</div>
     </div>
 
-    <div id="map"></div>
+    <div id="wrapper">
+      <div id="map"></div>
+      <div id="history-panel">
+        <div id="history-title">Histórico de pontos</div>
+        <div id="history-list"></div>
+      </div>
+    </div>
 
     <script
       src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
@@ -385,8 +468,8 @@ def render_tracking_public_html(session_id: str) -> str:
 
       const map = L.map('map');
 
-      // Mesmo tile simples da central (OpenStreetMap, sem nome de loja)
-      const tileLayer = L.tileLayer(
+      // Tile simples da central (OpenStreetMap)
+      L.tileLayer(
         'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
         {{
           maxZoom: 19,
@@ -395,78 +478,150 @@ def render_tracking_public_html(session_id: str) -> str:
       ).addTo(map);
 
       let marker = null;
-      let hasFirstFix = false;
+      let polyline = null;
+
+      const infoLine = document.getElementById('info-line');
+      const historyList = document.getElementById('history-list');
+
+      function normalizeIsoTs(tsRaw) {{
+        let iso = String(tsRaw || '').trim();
+        if (!iso) return '';
+
+        if (iso.indexOf('T') === -1 && iso.indexOf(' ') !== -1) {{
+          iso = iso.replace(' ', 'T');
+        }}
+
+        // corta microssegundos para milissegundos: .593255 -> .593
+        iso = iso.replace(/(\\.[0-9]{{3}})[0-9]+/, '$1');
+
+        if (!/(Z|[+\\-][0-9]{{2}}:?[0-9]{{2}})$/i.test(iso)) {{
+          iso = iso + 'Z';
+        }}
+
+        return iso;
+      }}
+
+      function formatTsToLocal(tsRaw) {{
+        if (!tsRaw) return '';
+        try {{
+          const iso = normalizeIsoTs(tsRaw);
+          if (!iso) return '';
+
+          const d = new Date(iso);
+          if (isNaN(d.getTime())) {{
+            return tsRaw;
+          }}
+
+          return d.toLocaleString('pt-BR', {{
+            timeZone: 'America/Sao_Paulo',
+            dateStyle: 'short',
+            timeStyle: 'medium'
+          }});
+        }} catch (e) {{
+          console.error('Erro ao converter data:', e);
+          return tsRaw;
+        }}
+      }}
+
+      function renderHistory(track) {{
+        historyList.innerHTML = '';
+        track.forEach((p, idx) => {{
+          const div = document.createElement('div');
+          div.className = 'hist-item' + (idx === track.length - 1 ? ' hist-last' : '');
+
+          const tsText = formatTsToLocal(p.ts);
+          const lat = typeof p.lat === 'number' ? p.lat.toFixed(5) : p.lat;
+          const lon = typeof p.lon === 'number' ? p.lon.toFixed(5) : p.lon;
+
+          const timeEl = document.createElement('div');
+          timeEl.className = 'hist-time';
+          timeEl.textContent = tsText;
+
+          const coordEl = document.createElement('div');
+          coordEl.className = 'hist-coord';
+          coordEl.textContent = lat + ', ' + lon;
+
+          div.appendChild(timeEl);
+          div.appendChild(coordEl);
+          historyList.appendChild(div);
+        }});
+
+        // rola pro último ponto
+        historyList.scrollTop = historyList.scrollHeight;
+      }}
 
       function atualizarMapa() {{
-        fetch('/api/live-track/list')
+        fetch('/api/live-track/track/' + SESSION_ID)
           .then(r => r.json())
           .then(data => {{
-            // a API pode devolver {{sessions: [...]}} ou direto um array
-            const lista = Array.isArray(data) ? data : (data.sessions || []);
-
-            if (!Array.isArray(lista)) {{
-              console.log('Resposta inesperada de /api/live-track/list', data);
+            if (!data || data.ok === false) {{
+              infoLine.textContent = 'Sessão não encontrada ou encerrada.';
               return;
             }}
 
-            const sess = lista.find(s => {{
-              const sid = s.id || s.session_id || s.code || s.token;
-              return sid === SESSION_ID;
-            }});
+            // backend pode devolver "track" ou "points"
+            const track = Array.isArray(data.track)
+              ? data.track
+              : (Array.isArray(data.points) ? data.points : []);
 
-            if (!sess) {{
-              document.getElementById('info-line').textContent =
-                'Sessão não encontrada ou encerrada.';
+            if (!track.length) {{
+              infoLine.textContent = 'Sessão encontrada, aguardando primeiros pontos...';
               return;
             }}
 
-            const lat =
-              sess.lat ??
-              sess.latitude ??
-              sess.last_lat ??
-              (sess.last_point && (sess.last_point.lat ?? sess.last_point.latitude));
+            // atualiza painel de histórico
+            renderHistory(track);
 
-            const lon =
-              sess.lon ??
-              sess.lng ??
-              sess.longitude ??
-              sess.last_lon ??
-              (sess.last_point && (sess.last_point.lon ?? sess.last_point.lng ?? sess.last_point.longitude));
+            const last = track[track.length - 1] || {{}};
+            const lat = last.lat;
+            const lon = last.lon;
 
             if (lat == null || lon == null) {{
-              document.getElementById('info-line').textContent =
-                'Sessão encontrada, mas ainda sem posição.';
+              infoLine.textContent = 'Sessão encontrada, mas sem coordenadas válidas.';
               return;
             }}
 
-            const ts =
-              sess.ts ||
-              sess.last_ts ||
-              (sess.last_point && (sess.last_point.ts || sess.last_point.time || sess.last_point.created_at)) ||
-              '';
-
+            const ts = last.ts || data.updated_at || '';
             const nome =
-              sess.display_name ||
-              sess.name ||
-              sess.nome ||
-              sess.phone ||
+              data.nome ||
+              data.name ||
+              data.phone ||
               SESSION_ID;
 
-            document.getElementById('info-line').textContent =
-              `Sessão: ${{nome}} — Última atualização: ${{ts}}`;
+            infoLine.textContent =
+              'Sessão: ' + nome + ' — Última atualização: ' + formatTsToLocal(ts);
 
-            const pos = [lat, lon];
+            // monta array [lat, lon] para polilinha
+            const latlngs = track
+              .filter(p => typeof p.lat === 'number' && typeof p.lon === 'number')
+              .map(p => [p.lat, p.lon]);
 
-            if (!hasFirstFix) {{
-              hasFirstFix = true;
-              map.setView(pos, 18);
+            if (!latlngs.length) {{
+              return;
+            }}
+
+            const pos = latlngs[latlngs.length - 1];
+
+            // cria / atualiza linha azul
+            if (!polyline) {{
+              polyline = L.polyline(latlngs, {{ color: '#00aaff', weight: 4 }}).addTo(map);
+              map.fitBounds(polyline.getBounds(), {{ padding: [30, 30] }});
+            }} else {{
+              polyline.setLatLngs(latlngs);
+            }}
+
+            // cria / move marcador
+            if (!marker) {{
               marker = L.marker(pos).addTo(map);
-            }} else if (marker) {{
+            }} else {{
               marker.setLatLng(pos);
             }}
+
+            // sempre acompanha o último ponto
+            map.panTo(pos);
           }})
           .catch(err => {{
-            console.error('Erro ao buscar lista de sessões', err);
+            console.error('Erro ao buscar trilha da sessão', err);
           }});
       }}
 
@@ -485,15 +640,16 @@ def render_tracking_public_html(session_id: str) -> str:
 # Base deste arquivo: backend/services
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Raiz do projeto: C:\dev\anjo_da_guarda_app
+# Raiz do projeto: C:\\dev\\anjo_da_guarda_app
 ROOT_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", ".."))
 
-# Pasta única de dados: C:\dev\anjo_da_guarda_app\data
+# Pasta única de dados: C:\\dev\\anjo_da_guarda_app\\data
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # Banco único do sistema
 DB_PATH = os.path.join(DATA_DIR, "anjo.db")
+
 
 def salvar_ponto_trilha(session_id: str, lat: float, lon: float, ts: str) -> None:
     """
@@ -524,7 +680,7 @@ def salvar_ponto_trilha(session_id: str, lat: float, lon: float, ts: str) -> Non
         conn.close()
 
 
-def listar_pontos_trilha(session_id: str):
+def listar_pontos_trilha(session_id: str) -> List[dict]:
     """
     Lista os pontos da trilha para a sessão, ordenados por created_at_utc.
     Retorna uma lista de dicts com chaves: session_id, lat, lon, ts.
@@ -566,4 +722,3 @@ def listar_pontos_trilha(session_id: str):
         return []
     finally:
         conn.close()
-
