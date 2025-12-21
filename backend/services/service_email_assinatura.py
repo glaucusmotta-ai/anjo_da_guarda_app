@@ -2,6 +2,7 @@ import os
 import smtplib
 from email.message import EmailMessage
 from pathlib import Path
+from typing import Optional
 
 
 def _load_env_from_file() -> None:
@@ -44,7 +45,11 @@ def _load_env_from_file() -> None:
 _load_env_from_file()
 
 
-def enviar_email_boas_vindas_assinatura(destinatario: str, plano: str) -> None:
+def enviar_email_boas_vindas_assinatura(
+    destinatario: str,
+    plano: str,
+    checkout_url: Optional[str] = None,
+) -> None:
     """
     Envia o e-mail de boas-vindas para uma nova assinatura criada pelo site.
     Usa as variáveis SMTP_ já configuradas no .env.
@@ -64,11 +69,15 @@ def enviar_email_boas_vindas_assinatura(destinatario: str, plano: str) -> None:
         )
         return
 
-    # Link de download do app (pode ser Play Store ou uma página sua com instruções)
+    # Link padrão da página pública
     link_download = os.getenv(
         "ANJO_DOWNLOAD_URL",
         "https://www.3g-brasil.com/anjo-da-guarda",
     )
+
+    # Se vier um checkout_url (Mercado Pago), usamos ele;
+    # senão, caímos no link público padrão.
+    link_principal = checkout_url or link_download
 
     # URL da imagem do QR Code (você depois sobe essa imagem no seu site)
     url_qrcode = os.getenv(
@@ -84,18 +93,25 @@ Olá,
 
 Obrigado por contratar o Anjo da Guarda no plano {plano}.
 
-1. Instale o app (Android)
-Baixe o app pelo link:
-{link_download}
+1. Conclua sua assinatura e instale o app (Android)
+Clique no link abaixo para concluir sua assinatura (pagamento, quando aplicável)
+e ver as instruções de instalação:
+{link_principal}
 
 Ou, se preferir, abra o link do QR Code (caso seu leitor use a imagem):
 {url_qrcode}
 
-2. Ative o canal oficial de WhatsApp
+2. Ative o canal oficial de WhatsApp (antes de fazer qualquer teste)
 - Salve o número +55 11 9617-4582 nos seus contatos (Anjo da Guarda / 3G Brasil);
-- Envie uma mensagem com "Oi" para esse número via WhatsApp.
+- Envie, a partir do seu próprio WhatsApp, uma mensagem com "Oi" para esse número;
+- Oriente cada pessoa que será cadastrada como contato de confiança no app
+  a também salvar esse número e enviar uma mensagem com "Oi" a partir do
+  próprio WhatsApp.
 
-Esse "Oi" é importante para liberar o canal de comunicação para:
+Esses "Ois" precisam ser enviados antes de você disparar testes de SOS
+ou usar o app no dia a dia. Isso é necessário para que a Meta/WhatsApp
+Business libere a janela de comunicação e permita:
+
 - Mensagem de boas-vindas;
 - Alertas de segurança disparados pelo app;
 - Comunicações relacionadas à sua proteção.
@@ -119,11 +135,12 @@ Equipe 3G Brasil / Anjo da Guarda
       <strong>{plano}</strong>.
     </p>
 
-    <h3>1. Instale o app (Android)</h3>
-    <p>Clique no link abaixo para instalar o aplicativo no seu celular Android:</p>
+    <h3>1. Conclua sua assinatura e instale o app (Android)</h3>
+    <p>Clique no link abaixo para concluir sua assinatura (pagamento, quando aplicável)
+       e ver as instruções de instalação:</p>
     <p>
-      <a href="{link_download}" target="_blank" style="color:#2563eb;">
-        {link_download}
+      <a href="{link_principal}" target="_blank" style="color:#2563eb;">
+        {link_principal}
       </a>
     </p>
 
@@ -136,15 +153,30 @@ Equipe 3G Brasil / Anjo da Guarda
       />
     </p>
 
-    <h3>2. Ative o canal oficial de WhatsApp</h3>
+    <h3>2. Ative o canal oficial de WhatsApp (antes de fazer qualquer teste)</h3>
     <p>
-      Salve em seus contatos o número
-      <strong>+55 11 9617-4582</strong>
-      (Anjo da Guarda / 3G Brasil).
+      Antes de disparar testes de SOS ou usar o app no dia a dia, faça o seguinte:
     </p>
+    <ol>
+      <li>
+        Salve em seus contatos o número
+        <strong>+55 11 9617-4582</strong>
+        (Anjo da Guarda / 3G Brasil).
+      </li>
+      <li>
+        Envie, a partir do seu próprio WhatsApp, uma mensagem com
+        <strong>"Oi"</strong> para esse número.
+      </li>
+      <li>
+        Peça para cada contato de confiança que será cadastrado no app
+        também salvar esse número e enviar uma mensagem com
+        <strong>"Oi"</strong> a partir do próprio WhatsApp.
+      </li>
+    </ol>
+
     <p>
-      Depois envie uma mensagem com <strong>"Oi"</strong> para esse número via WhatsApp.
-      Esse passo é necessário para liberar:
+      Esses passos são necessários para que a Meta/WhatsApp Business libere
+      a janela de comunicação e permita:
     </p>
     <ul>
       <li>Mensagem de boas-vindas;</li>
@@ -177,7 +209,6 @@ Equipe 3G Brasil / Anjo da Guarda
         smtp.starttls()
         smtp.login(user, password)
         smtp.send_message(msg)
-
 
     print(f"[ASSINATURAS] E-mail de boas-vindas enviado para {destinatario}")
 
