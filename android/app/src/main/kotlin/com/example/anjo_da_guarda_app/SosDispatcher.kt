@@ -6,16 +6,16 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
-import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.Normalizer
@@ -34,7 +34,7 @@ class SosDispatcher(private val ctx: Context) {
     // ---------------------------------------------------------
     // Backend de Live Tracking (FastAPI)
     // ---------------------------------------------------------
-    private val liveTrackBaseUrl = "https://anjo-track.3g-brasil.com"
+    private val liveTrackBaseUrl = "https://api.3g-brasil.com:8443"
     private val liveTrackEnabled = true
 
     // Controle de loop de live tracking (Android nativo)
@@ -337,9 +337,6 @@ class SosDispatcher(private val ctx: Context) {
             // texto base (sem link)
             val baseText = text
 
-            // Nome completo para todos os canais que precisam
-            val nomeCompleto = getNomeCompletoFromPrefs() ?: "Contato"
-
             // 1) Tenta iniciar live tracking e pegar o tracking_url
             val trackingLink = startLiveTrack(baseText, lat, lon)
 
@@ -394,14 +391,9 @@ class SosDispatcher(private val ctx: Context) {
             // E-MAIL – via backend FastAPI (/api/email-sos)
             thread {
                 try {
+                    // Para e-mail, mandamos o texto base + trackingLink separado
                     val finalTracking = trackingLink ?: link
-                    sendEmailViaBackend(
-                        nomeCompleto,
-                        lat,
-                        lon,
-                        finalTracking,
-                        emailTo
-                    )
+                    sendEmailViaBackend(baseText, emailTo, finalTracking)
                 } catch (t: Throwable) {
                     Log.e("MAIL_BACKEND", "falha MAIL via backend", t)
                 }
@@ -481,7 +473,10 @@ class SosDispatcher(private val ctx: Context) {
 
         val safeMsg = stripForSms(adjustedMsg)
 
-        list.filter { it.isNotBlank() }.forEach { to ->
+        list.filter { it.isNotBlank() }.forEach { toRaw ->
+            val to = normalizeMsisdn(toRaw)
+            if (to.isBlank()) return@forEach
+
             try {
                 val body = JSONObject()
                     .put("from", from)
@@ -507,7 +502,7 @@ class SosDispatcher(private val ctx: Context) {
                     Log.d("ZENVIA_SMS", "HTTP ${resp.code} to=$to body=$respBody")
                 }
             } catch (t: Throwable) {
-                Log.e("ZENVIA_SMS", "err to=$to", t)
+                Log.e("ZENVIA_SMS", "err to=$toRaw", t)
             }
         }
     }
@@ -546,7 +541,11 @@ class SosDispatcher(private val ctx: Context) {
         }
 
         // Link de rastreamento para o campo {{link_rastreamento}}
-        val trackingLink = (linkRastreamento ?: "https://maps.google.com/?q=0,0").trim()
+        val trackingLink = (linkRastreamento ?: "").trim()
+        if (trackingLink.isEmpty()) {
+            Log.w("ZENVIA_WA", "skip WA: link_rastreamento vazio")
+            return
+        }
         Log.d("ZENVIA_WA", "using link_rastreamento=$trackingLink")
 
         val templateId = "406d05ec-cd3c-4bca-add3-ddd521aef484"
@@ -623,18 +622,11 @@ class SosDispatcher(private val ctx: Context) {
             return
         }
 
-        // Mesmo se a lista vier vazia, deixamos o backend decidir o fallback
         val emails = list.filter { it.isNotBlank() }.map { it.trim() }
-
-        val emailsLog = if (emails.isEmpty()) {
-            "(vazio - backend vai usar fallback do .env)"
-        } else {
-            emails.joinToString()
+        if (emails.isEmpty()) {
+            Log.d("MAIL_BACKEND", "skip MAIL: lista de e-mails vazia")
+            return
         }
-        Log.d(
-            "MAIL_BACKEND",
-            "preparando chamada /api/email-sos emails=$emailsLog tracking=$trackingLink"
-        )
 
         val base = baseUrl.trimEnd('/')
         val url = "$base/api/email-sos"
@@ -667,4 +659,4 @@ class SosDispatcher(private val ctx: Context) {
             Log.e("MAIL_BACKEND", "erro ao enviar e-mail via backend", t)
         }
     }
-
+}

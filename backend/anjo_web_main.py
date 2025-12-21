@@ -75,11 +75,27 @@ from services.vendedor_comissao import (
     resumir_comissoes_por_vendedor,
 )
 
-
 from services.service_email_assinatura import enviar_email_boas_vindas_assinatura
+from services.service_pagamento import gerar_checkout_url
+from services.service_clientes import link_phone_to_user
+from schemas.assinaturas_sites import AssinaturaSiteIn
+from fastapi import Depends
+
+import services.service_auth_central as auth_central
+
+from services.service_auth_central import (
+    CENTRAL_COOKIE_NAME,
+    create_central_session,
+    require_central_session,
+    set_central_session_cookie,
+    clear_central_session_cookie,
+)
+
+
 
 
 ASSINATURAS_DEBUG_TOKEN = os.getenv("ASSINATURAS_DEBUG_TOKEN")
+
 
 def _check_debug_token(token: str) -> None:
     """
@@ -94,18 +110,6 @@ def _check_debug_token(token: str) -> None:
         # Token errado
         raise HTTPException(status_code=401, detail="Não autorizado.")
 
-
-# ---------------------------------------------------------
-# Assinaturas
-# ---------------------------------------------------------
-class AssinaturaSiteIn(BaseModel):
-    user_email: str
-    plano: str
-    valor_mensal_centavos: int
-
-    # opcional: só vem preenchido quando for venda via vendedor
-    desconto_centavos: int | None = 0
-    vendedor_email: str | None = None
 
 
 # ---------------------------------------------------------
@@ -374,7 +378,7 @@ def live_track_stop(payload: Dict[str, Any]):
 
 
 @app.get("/api/live-track/list")
-def live_track_list():
+def live_track_list(_user: str = Depends(require_central_session)):
     return live_track_list_handler(
         LIVE_TRACK_SESSIONS=LIVE_TRACK_SESSIONS,
         tracking_base_url=TRACKING_BASE_URL,
@@ -383,7 +387,7 @@ def live_track_list():
 
 
 @app.delete("/api/live-track/session/{session_id}")
-def live_track_delete(session_id: str):
+def live_track_delete(session_id: str, _user: str = Depends(require_central_session)):
     return live_track_delete_handler(session_id, LIVE_TRACK_SESSIONS)
 
 
@@ -397,19 +401,48 @@ def api_live_track_points(session_id: str):
 
 @app.post("/api/assinaturas/site", tags=["assinaturas"], summary="Api Assinatura Site")
 async def api_assinatura_site(body: AssinaturaSiteIn):
+    # Garante um valor em centavos (vem do site; se não vier, cai para 0)
+    valor_centavos = getattr(body, "valor_mensal_centavos", 0) or 0
+
+    # 1) Salva assinatura no banco
     novo_id = registrar_assinatura_site(
         user_email=body.user_email,
         plano=body.plano,
-        valor_mensal_centavos=body.valor_mensal_centavos,
-        desconto_centavos=body.desconto_centavos or 0,
-        vendedor_email=body.vendedor_email,
+        valor_mensal_centavos=valor_centavos,
+        desconto_centavos=getattr(body, "desconto_centavos", 0) or 0,
+        vendedor_email=getattr(body, "vendedor_email", None),
         # percentual_comissao fica no default (0.05 = 5%)
     )
 
-    enviar_email_boas_vindas_assinatura(body.user_email, body.plano)
+    # 2) Gera link de pagamento no Mercado Pago (ou link padrão, se não configurado)
+    checkout_url = gerar_checkout_url(
+        assinatura_id=novo_id,
+        plano=body.plano,
+        valor_centavos=valor_centavos,
+        email=body.user_email,
+    )
+
+    # 3) Envia e-mail de boas-vindas com link/QR code
+    enviar_email_boas_vindas_assinatura(
+        destinatario=body.user_email,
+        plano=body.plano,
+        checkout_url=checkout_url,
+    )
+
+    # 4) Vincula telefone ao cliente, se vier no payload
+    try:
+        telefone = getattr(body, "telefone", None)  # <<< aqui era phone
+        if telefone:
+            link_res = link_phone_to_user(
+                email=body.user_email,
+                phone_raw=telefone,
+                types=("sms", "whatsapp"),
+            )
+            logger.info("[ASSINATURAS][LINK_PHONE] %s", link_res)
+    except Exception as e:
+        logger.error("[ASSINATURAS][LINK_PHONE] erro ao vincular telefone: %s", e)
+
     return {"id": novo_id}
-
-
 
 ASSINATURAS_DEBUG_TOKEN = os.getenv("ASSINATURAS_DEBUG_TOKEN", "")
 
@@ -622,6 +655,141 @@ async def assinaturas_comissoes_csv(
     )
 
 
+def _central_users_env() -> dict:
+    # garante que backend/.env seja carregado também
+    try:
+        auth_central._load_env_from_file()
+    except Exception:
+        pass
+
+    users = {}
+    raw = (os.getenv("CENTRAL_USERS", "") or "").strip()
+    if raw:
+        for item in raw.split(";"):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            u, p = item.split(":", 1)
+            u = u.strip()
+            p = p.strip()
+            if u and p:
+                users[u] = p
+
+    # fallback opcional (se existir)
+    u1 = (os.getenv("CENTRAL_USER", "") or "").strip()
+    p1 = (os.getenv("CENTRAL_PASS", "") or "").strip()
+    if u1 and p1 and u1 not in users:
+        users[u1] = p1
+
+    return users
+
+
+def _render_central_login_html(error: str = "") -> str:
+    err_html = f"<div style='color:#b00020;margin:10px 0;'><b>{_html.escape(error)}</b></div>" if error else ""
+    return f"""
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Central - Login</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Arial; background:#0b0b0b; color:#eee; margin:0; }}
+    .card {{ max-width:420px; margin:10vh auto; background:#141414; border:1px solid #2a2a2a; border-radius:12px; padding:18px; }}
+    label {{ display:block; margin:10px 0 6px; font-size:14px; color:#cfcfcf; }}
+    input {{ width:100%; padding:10px; border-radius:10px; border:1px solid #333; background:#0f0f0f; color:#fff; }}
+    .row {{ display:flex; gap:8px; align-items:center; }}
+    .btn {{ width:100%; margin-top:14px; padding:10px; border-radius:10px; border:0; background:#2d7ff9; color:#fff; font-weight:700; cursor:pointer; }}
+    .eye {{ padding:10px 12px; border-radius:10px; border:1px solid #333; background:#0f0f0f; color:#fff; cursor:pointer; white-space:nowrap; }}
+    .hint {{ margin-top:10px; font-size:12px; color:#9a9a9a; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2 style="margin:0 0 8px;">Central</h2>
+    <div style="color:#9a9a9a;font-size:13px;">Acesso restrito</div>
+    {err_html}
+    <form method="post" action="/central/login">
+      <label>E-mail</label>
+      <input name="username" autocomplete="username" required />
+
+      <label>Senha</label>
+      <div class="row">
+        <input id="pwd" name="password" type="password" autocomplete="current-password" required />
+        <button class="eye" type="button" onclick="togglePwd()">👁</button>
+      </div>
+
+      <button class="btn" type="submit">Entrar</button>
+      <div class="hint">Dica: use o mesmo usuário/senha do CENTRAL_USERS no .env.</div>
+    </form>
+  </div>
+
+  <script>
+    function togglePwd(){{
+      const el = document.getElementById("pwd");
+      el.type = (el.type === "password") ? "text" : "password";
+    }}
+  </script>
+</body>
+</html>
+""".strip()
+
+
+@app.get("/central/login", response_class=HTMLResponse)
+def central_login_page():
+    return HTMLResponse(content=_render_central_login_html())
+
+
+@app.post("/central/login", response_class=HTMLResponse)
+def central_login_do(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    users = _central_users_env()
+    if not users:
+        return HTMLResponse(
+            content=_render_central_login_html("CENTRAL_USERS não configurado no .env."),
+            status_code=500,
+        )
+
+    u = (username or "").strip()
+    p = (password or "")
+
+    expected = users.get(u)
+    if (not expected) or (not secrets.compare_digest(p, expected)):
+        return HTMLResponse(
+            content=_render_central_login_html("Usuário ou senha inválidos."),
+            status_code=401,
+        )
+
+    ip = (request.client.host if request.client else "") or ""
+    ua = request.headers.get("user-agent", "") or ""
+
+    token = create_central_session(u, ip, ua)
+
+    resp = RedirectResponse(url="/central", status_code=302)
+    set_central_session_cookie(resp, token)
+    return resp
+
+
+@app.get("/central/logout")
+def central_logout(request: Request):
+    resp = RedirectResponse(url="/central/login", status_code=302)
+    clear_central_session_cookie(resp)
+    return resp
+
+
+@app.get("/central", response_class=HTMLResponse)
+def central(request: Request):
+    # se não tiver sessão válida, manda pro login
+    try:
+        _ = require_central_session(request)
+    except Exception:
+        return RedirectResponse(url="/central/login", status_code=302)
+
+    return render_central_page()
+
 
 
 from fastapi.responses import HTMLResponse  # (mantido; duplicado não quebra)
@@ -635,10 +803,6 @@ async def tracking_public(session_id: str):
     html = render_tracking_public_html(session_id)
     return HTMLResponse(content=html)
 
-
-@app.get("/central", response_class=HTMLResponse)
-def central_page():
-    return render_central_page()
 
 
 # ---------------------------------------------------------

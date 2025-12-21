@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Any, List
+from typing import Any
 
 # BASE_DIR = pasta "services"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -11,6 +11,7 @@ DB_PATH = os.path.join(DATA_DIR, "anjo.db")
 
 
 def _utc_now_iso() -> str:
+    """Retorna o horário UTC atual em ISO8601 (segundos) com sufixo 'Z'."""
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
@@ -25,14 +26,12 @@ def registrar_assinatura_site(
     desconto_centavos: int = 0,
     vendedor_email: str | None = None,
     percentual_comissao: float = 0.05,
-):
+) -> int:
     """
-    Registra uma nova assinatura vinda do SITE no banco anjo.db.
+    Registra uma nova assinatura na tabela `assinaturas`.
 
-    Agora:
-      - permite desconto em centavos
-      - permite informar o e-mail do vendedor
-      - calcula a comissão do vendedor (padrão 5%) sobre o valor líquido
+    - `desconto_centavos` entra no cálculo da comissão (base = valor - desconto).
+    - Se não houver `vendedor_email`, a comissão fica 0.
     """
 
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -42,19 +41,22 @@ def registrar_assinatura_site(
         conn.execute("PRAGMA foreign_keys = ON;")
 
         agora = _utc_now_iso()
-        prox_cobranca = (datetime.utcnow() + timedelta(days=30)).isoformat(
-            timespec="seconds"
-        ) + "Z"
+        prox_cobranca = (
+            datetime.utcnow() + timedelta(days=30)
+        ).isoformat(timespec="seconds") + "Z"
 
         # normaliza desconto (nunca negativo)
         desconto_centavos = max(int(desconto_centavos or 0), 0)
 
-        # valor base para comissão = bruto - desconto
-        valor_liquido_para_comissao = max(valor_mensal_centavos - desconto_centavos, 0)
+        # base para comissão = bruto - desconto
+        valor_liquido_para_comissao = max(
+            int(valor_mensal_centavos) - desconto_centavos, 0
+        )
 
-        # se não tiver vendedor, comissão = 0
         if vendedor_email:
-            comissao_centavos = int(round(valor_liquido_para_comissao * percentual_comissao))
+            comissao_centavos = int(
+                round(valor_liquido_para_comissao * float(percentual_comissao))
+            )
         else:
             comissao_centavos = 0
 
@@ -99,16 +101,17 @@ def registrar_assinatura_site(
         )
 
         conn.commit()
-        return cur.lastrowid
+        return int(cur.lastrowid)
 
     finally:
         conn.close()
 
 
-def listar_assinaturas_debug(limit: int = 100) -> List[dict[str, Any]]:
+def listar_assinaturas_debug(limit: int = 100) -> list[dict[str, Any]]:
     """
     Retorna as últimas assinaturas para debug interno (/api/assinaturas/debug).
-    Agora já inclui desconto, vendedor e comissão.
+
+    Já inclui desconto, vendedor e comissão.
     """
     os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -148,24 +151,13 @@ def listar_assinaturas_debug(limit: int = 100) -> List[dict[str, Any]]:
         conn.close()
 
 
-if __name__ == "__main__":
-    # Teste rápido manual (opcional)
-    novo_id = registrar_assinatura_site(
-        user_email="teste_comissao@example.com",
-        plano="Mensal individual — BRL 22,90",
-        valor_mensal_centavos=2290,
-        # simula venda COM vendedor e desconto
-        desconto_centavos=290,  # R$ 2,90 de desconto
-        vendedor_email="vendedor1@3g-brasil.com",
-        percentual_comissao=0.05,
-    )
-    print("Assinatura de teste criada com id =", novo_id)
-
-def listar_comissoes_por_vendedor(vendedor_email: str, limit: int = 500) -> dict[str, Any]:
+def listar_comissoes_por_vendedor(
+    vendedor_email: str, limit: int = 500
+) -> dict[str, Any]:
     """
     Retorna um resumo de comissões para UM vendedor específico.
 
-    - itens: lista de assinaturas dele (para conferência / planilha)
+    - itens: lista de assinaturas dele
     - totais: somatórios em centavos (bruto, desconto, líquido, comissão)
     """
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -228,3 +220,17 @@ def listar_comissoes_por_vendedor(vendedor_email: str, limit: int = 500) -> dict
         }
     finally:
         conn.close()
+
+
+if __name__ == "__main__":
+    # Teste rápido manual (opcional)
+    novo_id = registrar_assinatura_site(
+        user_email="teste_comissao@example.com",
+        plano="Mensal individual — BRL 22,90",
+        valor_mensal_centavos=2290,
+        # simula venda COM vendedor e desconto
+        desconto_centavos=290,  # R$ 2,90 de desconto
+        vendedor_email="vendedor1@3g-brasil.com",
+        percentual_comissao=0.05,
+    )
+    print("Assinatura de teste criada com id =", novo_id)

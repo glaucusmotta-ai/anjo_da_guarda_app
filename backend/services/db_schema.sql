@@ -5,6 +5,8 @@ PRAGMA foreign_keys=ON;
 ----------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS wa_dlr (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT,
+    telefone TEXT,
     message_id TEXT,
     to_number TEXT,
     status TEXT,
