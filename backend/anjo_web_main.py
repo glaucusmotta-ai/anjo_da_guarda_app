@@ -29,6 +29,14 @@ import requests
 import urllib3.util.connection as urllib3_cn
 from dotenv import load_dotenv
 
+# ---------------------------------------------------------
+# .env deve ser carregado ANTES de importar services que leem env no import
+# ---------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(BASE_DIR, ".env")  # backend/.env
+load_dotenv(ENV_PATH, override=True)
+
+
 from fastapi import (
     FastAPI,
     Request,
@@ -119,8 +127,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("anjo_da_guarda")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ENV_PATH = os.path.normpath(os.path.join(BASE_DIR, "..", ".env"))
-load_dotenv(ENV_PATH, override=True)
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+# load_dotenv já executado no topo
 logger.info("[ENV] usando .env em %s", ENV_PATH)
 
 DATA_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "data"))

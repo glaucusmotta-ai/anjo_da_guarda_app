@@ -664,11 +664,12 @@ def salvar_ponto_trilha(session_id: str, lat: float, lon: float, ts: str) -> Non
                 session_id,
                 created_at_utc,
                 lat,
-                lon
+                lon,
+                ts
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (session_id, str(ts), float(lat), float(lon)),
+            (session_id, str(ts), float(lat), float(lon), str(ts)),
         )
         conn.commit()
     except Exception as e:
