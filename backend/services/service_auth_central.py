@@ -8,7 +8,7 @@ from typing import Dict, Optional
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-# auto_error=False para a gente conseguir auditar tentativa sem credenciais
+# auto_error=False para auditar tentativa sem credenciais
 security = HTTPBasic(auto_error=False)
 
 
@@ -40,6 +40,7 @@ def _load_env_from_file() -> None:
                     if k and k not in os.environ:
                         os.environ[k] = v
         except Exception:
+            # nunca derruba
             pass
 
 
@@ -77,7 +78,7 @@ def _ensure_audit_table(conn: sqlite3.Connection) -> None:
 
 def _audit(username: str, ip: str, path: str, ok: bool, reason: str, user_agent: str) -> None:
     _load_env_from_file()
-    if os.getenv("CENTRAL_AUDIT", "0").strip() not in ("1", "true", "True", "YES", "yes"):
+    if os.getenv("CENTRAL_AUDIT", "0").strip().lower() not in ("1", "true", "yes", "on"):
         return
 
     try:
@@ -103,7 +104,7 @@ def _audit(username: str, ip: str, path: str, ok: bool, reason: str, user_agent:
         finally:
             conn.close()
     except Exception:
-        # auditoria nunca pode derrubar o sistema
+        # auditoria nunca derruba o sistema
         pass
 
 
@@ -140,8 +141,18 @@ def _parse_central_users() -> Dict[str, str]:
     return users
 
 
+def central_validate_credentials(username: str, password: str) -> bool:
+    allowed = _parse_central_users()
+    user = (username or "").strip()
+    pwd = password or ""
+    expected = allowed.get(user)
+    if not expected:
+        return False
+    return secrets.compare_digest(pwd, expected)
+
+
 def _raise_unauthorized_basic() -> None:
-    # usado apenas no Basic (se você usar em endpoints de API)
+    # usado apenas no Basic Auth (se você usar em endpoints de API)
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Não autorizado",
@@ -150,7 +161,7 @@ def _raise_unauthorized_basic() -> None:
 
 
 def _raise_unauthorized_session() -> None:
-    # usado para sessão por cookie (NÃO dispara popup Basic no navegador)
+    # usado para sessão por cookie (não abre popup Basic)
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Não autorizado",
@@ -162,8 +173,8 @@ def require_central_auth(
     credentials: Optional[HTTPBasicCredentials] = Depends(security),
 ) -> str:
     """
-    Basic Auth (se você quiser proteger APIs admin).
-    Retorna o username autenticado (email).
+    Basic Auth (opcional).
+    Retorna o username autenticado.
     """
     allowed = _parse_central_users()
 
@@ -204,6 +215,7 @@ def _cookie_name() -> str:
     v = (os.getenv("CENTRAL_COOKIE_NAME") or "central_session").strip()
     return v or "central_session"
 
+
 # Compatibilidade com imports antigos (ex.: anjo_web_main.py)
 CENTRAL_COOKIE_NAME = _cookie_name()
 
@@ -216,7 +228,6 @@ def _session_ttl_min() -> int:
     except Exception:
         return 60
 
-CENTRAL_SESSION_TTL_MIN = _session_ttl_min()
 
 def _cookie_secure_flag() -> bool:
     _load_env_from_file()
@@ -225,10 +236,17 @@ def _cookie_secure_flag() -> bool:
 
 
 def _session_secret() -> str:
+    """
+    Secret para hashear o token antes de salvar no DB.
+    NÃO salva token puro no DB.
+    """
     _load_env_from_file()
     secret = (os.getenv("CENTRAL_SESSION_SECRET") or "").strip()
     if not secret or len(secret) < 16:
-        raise HTTPException(status_code=500, detail="CENTRAL_SESSION_SECRET não configurado (ou muito curto).")
+        raise HTTPException(
+            status_code=500,
+            detail="CENTRAL_SESSION_SECRET não configurado (ou muito curto)."
+        )
     return secret
 
 
@@ -259,9 +277,9 @@ def _ensure_sessions_table(conn: sqlite3.Connection) -> None:
 
 def create_central_session(username: str, ip: str, user_agent: str) -> str:
     """
-    Cria sessão no DB e devolve o token (vai no cookie HttpOnly).
+    Cria sessão no DB e devolve o TOKEN (vai no cookie HttpOnly).
     """
-    token = secrets.token_urlsafe(32)  # ~43 chars
+    token = secrets.token_urlsafe(32)
     token_hash = _hash_session_token(token)
 
     now = datetime.now(timezone.utc)
@@ -272,12 +290,15 @@ def create_central_session(username: str, ip: str, user_agent: str) -> str:
         _ensure_sessions_table(conn)
         conn.execute(
             """
-            INSERT INTO central_sessions(token_hash, username, created_at_utc, expires_at_utc, last_seen_utc, ip, user_agent, revoked)
+            INSERT INTO central_sessions(
+              token_hash, username, created_at_utc, expires_at_utc,
+              last_seen_utc, ip, user_agent, revoked
+            )
             VALUES(?,?,?,?,?,?,?,0)
             """,
             (
                 token_hash,
-                username,
+                (username or "").strip(),
                 now.isoformat(),
                 exp.isoformat(),
                 now.isoformat(),
@@ -320,7 +341,7 @@ def validate_central_session(token: str, request: Optional[Request] = None) -> s
     if request is not None:
         ip = (request.client.host if request.client else "") or ""
         path = request.url.path
-        ua = request.headers.get("user-agent", "")
+        ua = request.headers.get("user-agent", "") or ""
 
     conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
@@ -356,7 +377,7 @@ def validate_central_session(token: str, request: Optional[Request] = None) -> s
         if request is not None:
             conn.execute(
                 "UPDATE central_sessions SET last_seen_utc=?, ip=?, user_agent=? WHERE token_hash=?",
-                (datetime.now(timezone.utc).isoformat(), (ip or "")[:80], (ua or "")[:300], token_hash),
+                (now.isoformat(), (ip or "")[:80], (ua or "")[:300], token_hash),
             )
             conn.commit()
             _audit(str(row["username"]), ip, path, True, "SESSION_OK", ua)
@@ -371,36 +392,29 @@ def require_central_session(request: Request) -> str:
     return validate_central_session(token, request)
 
 
-# --- compatibilidade com o nome antigo (se algum código chamar) ---
-def make_session_token(username: str, request: Optional[Request] = None) -> str:
-    ip = (request.client.host if request and request.client else "") if request else ""
-    ua = request.headers.get("user-agent", "") if request else ""
-    return create_central_session(username, ip, ua)
+# =========================================================
+# COOKIE HELPERS (compatível com anjo_web_main.py)
+# =========================================================
 
-
-def verify_session_token(token: str) -> Optional[str]:
-    try:
-        return validate_central_session(token, None)
-    except Exception:
-        return None
-
-
-def set_central_session_cookie(response, username: str, request: Optional[Request] = None) -> None:
+def set_central_session_cookie(response, token: str) -> None:
     """
-    Seta cookie HttpOnly da sessão do Central.
-    (request é opcional para não quebrar chamadas antigas)
-    """
-    token = make_session_token(username, request=request)
+    Recebe o TOKEN já criado por create_central_session() e grava no cookie.
 
-    max_age = _session_ttl_min() * 60
+    Agora: o cookie expira no navegador no mesmo TTL da sessão do servidor,
+    evitando “cookie velho” que fica no browser e depois dá 401.
+    """
+    ttl_sec = _session_ttl_min() * 60
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_sec)
+
     response.set_cookie(
         key=_cookie_name(),
         value=token,
-        max_age=max_age,
         httponly=True,
         secure=_cookie_secure_flag(),
         samesite="lax",
         path="/",
+        max_age=ttl_sec,
+        expires=expires_at,  # pode remover esta linha se quiser só max_age
     )
 
 
@@ -408,23 +422,7 @@ def clear_central_session_cookie(response) -> None:
     response.delete_cookie(key=_cookie_name(), path="/")
 
 
-def central_validate_credentials(username: str, password: str) -> bool:
-    """
-    Valida usuário/senha contra CENTRAL_USERS (e fallback CENTRAL_USER/CENTRAL_PASS).
-    """
-    allowed = _parse_central_users()
-    user = (username or "").strip()
-    pwd = password or ""
-    expected = allowed.get(user)
-    if not expected:
-        return False
-    return secrets.compare_digest(pwd, expected)
-
-
 def central_user_from_request(request: Request) -> Optional[str]:
-    """
-    Se existir cookie de sessão válido, devolve o username.
-    """
     token = request.cookies.get(_cookie_name())
     if not token:
         return None
