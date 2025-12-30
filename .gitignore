@@ -57,3 +57,10 @@ __pycache__/
 backend/.env
 *.env
 
+
+# nao versionar backups locais
+/ios_old/
+# nao versionar bancos
+/backend/data/*.db
+/backend/data/*.db-*
+
