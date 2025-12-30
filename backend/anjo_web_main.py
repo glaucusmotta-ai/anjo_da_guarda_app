@@ -52,6 +52,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from services.metrics import registrar_sos_event
+from services.service_worklog_ui import router as worklog_ui_router
+
 
 
 # ---------------------------------------------------------
@@ -108,6 +110,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(worklog_ui_router)
 
 
 # ---------------------------------------------------------

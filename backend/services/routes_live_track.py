@@ -327,7 +327,11 @@ def live_track_delete_handler(session_id: str, LIVE_TRACK_SESSIONS):
 
 
 def api_live_track_points_handler(session_id: str, listar_pontos_trilha):
-    points = listar_pontos_trilha(session_id)
-    if not points:
-        raise HTTPException(status_code=404, detail="Sessão não encontrada")
-    return JSONResponse({"ok": True, "points": points})
+    points = listar_pontos_trilha(session_id) or []
+    return JSONResponse({
+        "ok": True,
+        "session_id": session_id,
+        "count": len(points),
+        "points": points,
+    })
+
