@@ -10,6 +10,7 @@ class AssinaturaSiteIn(BaseModel):
 
     # Dados da assinatura / cobrança
     plano: str
-    valor_mensal_centavos: int
+    valor_mensal_centavos: Optional[int] = 0
     desconto_centavos: Optional[int] = 0
     vendedor_email: Optional[EmailStr] = None
+    coupon_code: Optional[str] = None
