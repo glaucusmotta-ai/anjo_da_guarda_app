@@ -66,7 +66,7 @@ android {
             buildConfigField(
                 "String",
                 "TELEGRAM_BOT_TOKEN",
-                "\"8218538803:AAF4f01L5YpdnhqmYMKHtZPWIwZomK58yJ4\""
+                "\"8006611977:AAG4ltDC_u6GjZ23sZ0xJsCj5ubKntoI1VY\""
             )
             buildConfigField(
                 "String",

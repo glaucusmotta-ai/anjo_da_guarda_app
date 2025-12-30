@@ -1,11 +1,14 @@
 // lib/screens/settings_screen.dart
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart'; // kDebugMode
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../services/settings_store.dart';
-import '../services/native_sos.dart'; // quickLatLon (se quisermos usar depois)
 import '../widgets/user_profile_section.dart';
 import '../theme/anjo_theme.dart';
 
@@ -19,6 +22,27 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   final _form = GlobalKey<FormState>();
   final _userProfileKey = GlobalKey<UserProfileSectionState>();
+
+  /// MASTER (só existe se você passar --dart-define=MASTER_UNLOCK=...)
+  static const String _masterUnlockCode =
+      String.fromEnvironment('MASTER_UNLOCK', defaultValue: '');
+
+  /// Base do backend para validar códigos (entitlements).
+  /// ATENÇÃO: é a BASE do host (SEM /central).
+  ///
+  /// Exemplos corretos:
+  ///   - Central (admin): https://anjo-track.3g-brasil.com/central
+  ///   - Redeem (entitlements): https://anjo-track.3g-brasil.com/api/entitlements/redeem
+  ///
+  /// Você pode sobrescrever via dart-define:
+  /// flutter run --release --dart-define=ENTITLEMENTS_API_BASE=https://anjo-track.3g-brasil.com
+  static const String _entitlementsApiBase = String.fromEnvironment(
+    'ENTITLEMENTS_API_BASE',
+    defaultValue: 'https://anjo-track.3g-brasil.com',
+  );
+
+  // Link do site (apenas informativo no popup)
+  static const String _smsAddonBuyUrl = 'https://www.3g-brasil.com/';
 
   // Cliente
   final _userName = TextEditingController();
@@ -41,6 +65,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _pinSecondLayerEnabled = true;
   bool _qsEnabled = true; // atalho no painel rápido
   bool _audioEnabled = true; // liga/desliga disparo por voz
+
+  // ✅ SMSAddon (toggle + entitlement)
+  bool _smsAddonEnabled = false; // liga/desliga uso do addon
+  bool _smsAddonEntitled = false; // se tem direito (código válido)
 
   // Telegram
   final _tgTarget =
@@ -104,15 +132,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _load() async {
     final s = await SettingsStore.instance.load();
 
-    // carrega senhas de áudio personalizadas + toggle de áudio (se houver)
+    // carrega senhas de áudio personalizadas + toggle de áudio + toggle SMSAddon (se houver)
     String audio1 = '';
     String audio2 = '';
     bool audioEnabled = true;
+
+    bool smsAddonEnabled = false;
+    bool smsAddonEntitled = false;
+
     try {
       final prefs = await SharedPreferences.getInstance();
+
       audio1 = prefs.getString('audioToken1') ?? '';
       audio2 = prefs.getString('audioToken2') ?? '';
       audioEnabled = prefs.getBool('audioEnabled') ?? true;
+
+      smsAddonEnabled = prefs.getBool('smsAddonEnabled') ?? false;
+      smsAddonEntitled = prefs.getBool('smsAddonEntitled') ?? false;
     } catch (_) {}
 
     setState(() {
@@ -163,6 +199,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       // Toggle de áudio
       _audioEnabled = audioEnabled;
 
+      // ✅ SMSAddon
+      _smsAddonEnabled = smsAddonEnabled;
+      _smsAddonEntitled = smsAddonEntitled;
+
       _loading = false;
     });
   }
@@ -202,6 +242,204 @@ class _SettingsScreenState extends State<SettingsScreen> {
         RegExp(r'^@[A-Za-z0-9_]{5,}$').hasMatch(s);
     if (!ok) return "Use chat_id numérico ou @canal/@grupo/@username";
     return null;
+  }
+
+  Future<void> _persistSmsAddonFlags() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('smsAddonEnabled', _smsAddonEnabled);
+      await prefs.setBool('smsAddonEntitled', _smsAddonEntitled);
+    } catch (_) {}
+  }
+
+  Future<String> _getOrCreateDeviceId() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final existing = prefs.getString('deviceId');
+      if (existing != null && existing.trim().isNotEmpty) return existing.trim();
+
+      final rnd = Random.secure();
+      final bytes = List<int>.generate(16, (_) => rnd.nextInt(256));
+      final id = base64UrlEncode(bytes).replaceAll('=', '');
+
+      await prefs.setString('deviceId', id);
+      return id;
+    } catch (_) {
+      // fallback (não ideal, mas evita crash)
+      return DateTime.now().microsecondsSinceEpoch.toString();
+    }
+  }
+
+  String _normalizeEntitlementsBase(String raw) {
+    var base = raw.trim().replaceAll(RegExp(r'/+$'), '');
+    // Blindagem: se alguém passar /central por engano, remove.
+    base = base.replaceAll(RegExp(r'/central/?$'), '');
+    return base;
+  }
+
+  Future<bool> _redeemCodeOnServer(String code) async {
+    final base = _normalizeEntitlementsBase(_entitlementsApiBase);
+    if (base.isEmpty) return false;
+
+    final deviceId = await _getOrCreateDeviceId();
+
+    final uri = Uri.parse('$base/api/entitlements/redeem');
+
+    final payload = <String, dynamic>{
+      'code': code,
+      'feature': 'sms_addon',
+      'device_id': deviceId,
+    };
+
+    final client = HttpClient();
+    client.connectionTimeout = const Duration(seconds: 8);
+
+    try {
+      final req = await client.postUrl(uri);
+      req.headers.contentType = ContentType.json;
+      req.add(utf8.encode(jsonEncode(payload)));
+
+      final res = await req.close().timeout(const Duration(seconds: 10));
+      final body = await utf8.decodeStream(res);
+
+      if (res.statusCode != 200) return false;
+
+      try {
+        final json = jsonDecode(body);
+        if (json is Map && json['ok'] == true) return true;
+      } catch (_) {}
+
+      // se não vier json ok:true, considera inválido
+      return false;
+    } catch (_) {
+      return false;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<bool> _tryUnlockWithCode(String code) async {
+    final c = code.trim();
+    if (c.isEmpty) return false;
+
+    // 1) MASTER (só você)
+    if (_masterUnlockCode.isNotEmpty && c == _masterUnlockCode) {
+      _smsAddonEntitled = true;
+      _smsAddonEnabled = true;
+      await _persistSmsAddonFlags();
+      return true;
+    }
+
+    // 2) Fluxo real (servidor)
+    final ok = await _redeemCodeOnServer(c);
+    if (ok) {
+      _smsAddonEntitled = true;
+      _smsAddonEnabled = true;
+      await _persistSmsAddonFlags();
+      return true;
+    }
+
+    return false;
+  }
+
+  Future<bool> _showUnlockCodeDialog(BuildContext context) async {
+    final ctrl = TextEditingController();
+    bool busy = false;
+    String? err;
+
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setStateDialog) {
+            Future<void> submit() async {
+              final code = ctrl.text.trim();
+              if (code.isEmpty) {
+                setStateDialog(() => err = 'Digite o código');
+                return;
+              }
+
+              setStateDialog(() {
+                busy = true;
+                err = null;
+              });
+
+              final ok = await _tryUnlockWithCode(code);
+
+              if (!ctx.mounted) return;
+
+              if (!ok) {
+                setStateDialog(() {
+                  busy = false;
+                  err = 'Código inválido ou já usado';
+                });
+                return;
+              }
+
+              Navigator.of(ctx).pop(true);
+            }
+
+            return AlertDialog(
+              backgroundColor: const Color(0xFF111216),
+              title: const Text(
+                'Desbloqueio do SMSAddon',
+                style: TextStyle(color: Colors.white),
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    'Digite o código de desbloqueio. '
+                    'Após contratar, você recebe um código único.\n\n'
+                    'Site: $_smsAddonBuyUrl',
+                    style: const TextStyle(color: Colors.white70, fontSize: 13),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: ctrl,
+                    autofocus: true,
+                    enabled: !busy,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: InputDecoration(
+                      labelText: 'Código',
+                      labelStyle: const TextStyle(color: Colors.white70),
+                      errorText: err,
+                      enabledBorder: const UnderlineInputBorder(
+                        borderSide: BorderSide(color: Colors.white30),
+                      ),
+                      focusedBorder: const UnderlineInputBorder(
+                        borderSide: BorderSide(color: Colors.white),
+                      ),
+                    ),
+                    onSubmitted: (_) => submit(),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: busy ? null : () => Navigator.of(ctx).pop(false),
+                  child: const Text('Cancelar'),
+                ),
+                ElevatedButton(
+                  onPressed: busy ? null : submit,
+                  child: busy
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Validar'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    ctrl.dispose();
+    return result == true;
   }
 
   Future<void> _save() async {
@@ -288,9 +526,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await prefs.setString('emailTo1', _t(_emailTo1.text));
       await prefs.setString('emailTo2', _t(_emailTo2.text));
       await prefs.setString('emailTo3', _t(_emailTo3.text));
-    } catch (_) {
-      // se der erro aqui, não quebra o fluxo principal
-    }
+
+      // ✅ SMSAddon – flags
+      await prefs.setBool('smsAddonEnabled', _smsAddonEnabled);
+      await prefs.setBool('smsAddonEntitled', _smsAddonEntitled);
+    } catch (_) {}
 
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -312,10 +552,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       context: context,
       builder: (_) => AlertDialog(
         backgroundColor: const Color(0xFF111216),
-        title: Text(
-          label,
-          style: const TextStyle(color: Colors.white),
-        ),
+        title: Text(label, style: const TextStyle(color: Colors.white)),
         content: TextField(
           controller: temp,
           autofocus: true,
@@ -370,10 +607,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       context: context,
       builder: (_) => AlertDialog(
         backgroundColor: const Color(0xFF111216),
-        title: const Text(
-          'Confirme seu PIN',
-          style: TextStyle(color: Colors.white),
-        ),
+        title: const Text('Confirme seu PIN',
+            style: TextStyle(color: Colors.white)),
         content: TextField(
           controller: pinController,
           keyboardType: TextInputType.number,
@@ -420,9 +655,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (value.isEmpty) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Senha $which ainda não configurada.'),
-        ),
+        SnackBar(content: Text('Senha $which ainda não configurada.')),
       );
       return;
     }
@@ -431,14 +664,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       context: context,
       builder: (_) => AlertDialog(
         backgroundColor: const Color(0xFF111216),
-        title: Text(
-          'Senha $which de áudio',
-          style: const TextStyle(color: Colors.white),
-        ),
-        content: Text(
-          value,
-          style: const TextStyle(color: Colors.white),
-        ),
+        title: Text('Senha $which de áudio',
+            style: const TextStyle(color: Colors.white)),
+        content: Text(value, style: const TextStyle(color: Colors.white)),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
@@ -450,7 +678,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _testSends() async {
-    //  Já usou os 2 testes? Só avisa e sai.
     if (_testCount >= 2) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -464,11 +691,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       return;
     }
 
-    // incrementa contador de testes (créditos) e persiste
     setState(() => _testCount++);
     await SettingsStore.instance.setTestCount(_testCount);
 
-    // marca flag para uso futuro na Home (se necessário)
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool('pendingTestFromSettings', true);
@@ -476,7 +701,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     if (!mounted) return;
 
-    // vai para a Home; disparo real será pelo botão "Iniciar serviço"
     Navigator.of(context).pushNamed('/home');
 
     ScaffoldMessenger.of(context).showSnackBar(
@@ -494,10 +718,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       context: context,
       builder: (_) => AlertDialog(
         backgroundColor: const Color(0xFF111216),
-        title: const Text(
-          'Como ativar o atalho SOS',
-          style: TextStyle(color: Colors.white),
-        ),
+        title: const Text('Como ativar o atalho SOS',
+            style: TextStyle(color: Colors.white)),
         content: const Text(
           '1) Deslize duas vezes para baixo na barra de status.\n'
           '2) Toque em “Editar” ou no lápis.\n'
@@ -610,7 +832,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  // Pequeno "waveform" de risquinhos ocupando todo o campo
   Widget _audioWave(bool active) {
     final color = active ? Colors.white70 : Colors.white24;
     return Row(
@@ -631,7 +852,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  // Tile visual de áudio: faixa com risquinhos + mic + olhinho
   Widget _audioTile({
     required String description,
     required String value,
@@ -705,7 +925,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
 
-    // garante que não fica negativo se vier algo zoado do banco
     final testsLeft = (_testCount >= 2) ? 0 : (2 - _testCount);
 
     return Theme(
@@ -739,7 +958,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   child: ListView(
                     padding: const EdgeInsets.fromLTRB(14, 12, 14, 90),
                     children: [
-                      // 🔹 Informações adicionais / região para métricas
                       _card(
                         'Informações adicionais',
                         Icons.location_on_outlined,
@@ -751,7 +969,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             'e relatórios do Anjo da Guarda.',
                       ),
 
-                      // Dados do cliente
                       _card('Seus dados', Icons.person, [
                         TextFormField(
                           controller: _userName,
@@ -785,7 +1002,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                       ]),
 
-                      // PINs
                       _card(
                         'PINs',
                         Icons.lock_outline,
@@ -851,7 +1067,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ],
                       ),
 
-                      // Senhas de áudio (coação em 2 etapas)
                       _card(
                         'Senhas de Áudio (Coação em 2 etapas)',
                         Icons.hearing,
@@ -880,7 +1095,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ],
                       ),
 
-                      // Telegram
                       _card('Telegram', Icons.send, [
                         TextFormField(
                           controller: _tgTarget,
@@ -901,7 +1115,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                       ]),
 
-                      // SMS
                       _card(
                         'SMS',
                         Icons.sms_outlined,
@@ -939,12 +1152,87 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               icon: Icons.phone_iphone,
                             ),
                           ),
+
+                          SwitchListTile(
+                            value: _smsAddonEnabled,
+                            onChanged: (v) async {
+                              if (!v) {
+                                setState(() => _smsAddonEnabled = false);
+                                await _persistSmsAddonFlags();
+                                return;
+                              }
+
+                              if (kDebugMode) {
+                                setState(() => _smsAddonEnabled = true);
+                                await _persistSmsAddonFlags();
+                                return;
+                              }
+
+                              if (_smsAddonEntitled) {
+                                setState(() => _smsAddonEnabled = true);
+                                await _persistSmsAddonFlags();
+                                return;
+                              }
+
+                              final ok = await _showUnlockCodeDialog(context);
+
+                              if (!mounted) return;
+
+                              if (ok) {
+                                setState(() {});
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('SMSAddon liberado e ativado.'),
+                                  ),
+                                );
+                                return;
+                              }
+
+                              setState(() => _smsAddonEnabled = false);
+                              await _persistSmsAddonFlags();
+                            },
+                            title: const Text('Serviço SMSAddon'),
+                            subtitle: const Text(
+                              'Ativa o envio de SMS pelo chip quando estiver sem internet.',
+                            ),
+                            contentPadding: EdgeInsets.zero,
+                            activeColor: AnjoTheme.neonGreen,
+                          ),
+
+                          if (_masterUnlockCode.isNotEmpty)
+                            Align(
+                              alignment: Alignment.centerRight,
+                              child: TextButton.icon(
+                                onPressed: () async {
+                                  _smsAddonEnabled = false;
+                                  _smsAddonEntitled = false;
+                                  await _persistSmsAddonFlags();
+                                  if (!mounted) return;
+                                  setState(() {});
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content: Text(
+                                        '[ADMIN] SMSAddon zerado (OFF + sem entitlement).',
+                                      ),
+                                    ),
+                                  );
+                                },
+                                icon: const Icon(
+                                  Icons.restart_alt,
+                                  size: 18,
+                                  color: Colors.white70,
+                                ),
+                                label: const Text(
+                                  '[ADMIN] Zerar SMSAddon',
+                                  style: TextStyle(color: Colors.white70),
+                                ),
+                              ),
+                            ),
                         ],
                         subtitle:
                             'Preencha no formato +559999999999 (sem espaços).',
                       ),
 
-                      // WhatsApp
                       _card(
                         'WhatsApp',
                         Icons.chat,
@@ -987,7 +1275,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             'Preencha no formato +559999999999 (sem espaços).',
                       ),
 
-                      // E-mail
                       _card('E-mail', Icons.email_outlined, [
                         TextFormField(
                           controller: _emailTo1,
@@ -1029,7 +1316,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                       ]),
 
-                      // Preferências (apenas toggles)
                       _card('Preferências', Icons.tune, [
                         SwitchListTile(
                           value: _pinSecondLayerEnabled,
@@ -1042,11 +1328,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           contentPadding: EdgeInsets.zero,
                           activeColor: AnjoTheme.neonGreen,
                         ),
-                        // toggle para disparo por voz
                         SwitchListTile(
                           value: _audioEnabled,
-                          onChanged: (v) =>
-                              setState(() => _audioEnabled = v),
+                          onChanged: (v) => setState(() => _audioEnabled = v),
                           title: const Text('Ativar disparo por voz (beta)'),
                           subtitle: const Text(
                             'Se desativar, o SOS por áudio fica desligado; use apenas o PIN de coação.',
@@ -1074,7 +1358,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                       ]),
 
-                      // Card de salvar configurações (botão fixo)
                       _card('Salvar configurações', Icons.save_outlined, [
                         const Text(
                           'Depois de ajustar os dados e preferências, toque em '
@@ -1094,7 +1377,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                       ]),
 
-                      // Card de testes (separado das preferências)
                       _card('Testes (limite 2)', Icons.bolt, [
                         ListTile(
                           contentPadding: EdgeInsets.zero,
@@ -1122,8 +1404,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             fontSize: 11,
                           ),
                         ),
-
-                        // 🔹 Botão DEV-ONLY para resetar contador de testes (só aparece em debug)
                         if (kDebugMode)
                           Align(
                             alignment: Alignment.centerRight,
@@ -1156,7 +1436,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                 ),
         ),
-        // botão flutuante removido: agora o SALVAR está em um card próprio
         floatingActionButton: null,
       ),
     );
