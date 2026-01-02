@@ -38,10 +38,9 @@ def worklog_page(req: Request):
         linear-gradient(180deg, var(--bg0), var(--bg1));
       color: var(--text);
       display:flex;
-      align-items:flex-start;   /* <- permite conteúdo crescer */
+      align-items:center;
       justify-content:center;
       padding: 18px;
-      overflow-y:auto;          /* <- scroll se precisar */
     }
 
     .wrap{ width: 100%; max-width: 980px; }
@@ -66,6 +65,10 @@ def worklog_page(req: Request):
         0 0 18px rgba(13,231,255,.20),
         0 0 28px rgba(124,58,237,.14);
       backdrop-filter: blur(10px);
+
+      /* garante que o Logout nunca fique "fora da tela" */
+      max-height: calc(100vh - 140px);
+      overflow: auto;
     }
 
     .grid{ display:grid; grid-template-columns: 1fr; gap: 12px; }
@@ -160,6 +163,14 @@ def worklog_page(req: Request):
       align-items:center;
       gap: 10px;
       margin-bottom: 10px;
+
+      /* fixo dentro do card */
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      padding: 6px 0 10px;
+      background: linear-gradient(180deg, rgba(11,19,32,.92), rgba(11,19,32,.30));
+      backdrop-filter: blur(6px);
     }
     .mini{
       font-size: 12px;
@@ -193,29 +204,35 @@ def worklog_page(req: Request):
     .entry h3{ margin: 6px 0 4px; font-size: 16px; }
     .entry p{ margin: 0; color: var(--text); opacity: .95; line-height: 1.35; }
 
-    /* LOGOUT sempre acessível */
-    .logout-fab{
-      position: fixed;
-      right: 18px;
-      top: 18px;
-      z-index: 9999;
-      padding: 10px 14px;
-      border-radius: 12px;
-      font-weight: 900;
-      cursor: pointer;
-      border: 1px solid rgba(13,231,255,.30);
-      color: var(--text);
-      background: rgba(6,12,20,.72);
-      backdrop-filter: blur(10px);
-      box-shadow: 0 0 16px rgba(13,231,255,.18), 0 0 26px rgba(124,58,237,.12);
+    /* DEPT */
+    .dept-grid{
+      display:grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
     }
-    .logout-fab:hover{ border-color: rgba(13,231,255,.55); }
+    @media (max-width: 680px){
+      .dept-grid{ grid-template-columns: 1fr; }
+    }
+    .dept-note{
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+    .dept-chip{
+      display:inline-block;
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(13,231,255,.22);
+      background: rgba(13,231,255,.08);
+      margin-left: 8px;
+      color: var(--text);
+      font-weight: 900;
+    }
   </style>
 </head>
 
 <body>
-  <button class="logout-fab hidden" id="btnLogoutFab">Sair</button>
-
   <div class="wrap">
     <div class="brand">3G Brasil • Anjo da Guarda • Worklog</div>
 
@@ -249,14 +266,72 @@ def worklog_page(req: Request):
         <div class="msg hidden" id="msgErr"></div>
       </div>
 
+      <!-- DEPARTAMENTOS (abre após login) -->
+      <div class="grid hidden" id="deptBox">
+        <div class="topbar">
+          <div>
+            <div class="title" style="margin:0">Selecione o Departamento</div>
+            <div class="mini">Isso define o contexto do seu worklog hoje.</div>
+          </div>
+          <button class="btn-ghost" id="btnLogout2">Logout</button>
+        </div>
+
+        <div class="dept-note">Escolha um departamento para entrar no Worklog do dia:</div>
+
+        <div id="deptMain" class="dept-grid">
+          <button class="btn-ghost" id="btnDeptEng">Engenharia / Desenvolvimento</button>
+          <button class="btn-ghost" data-dept="Marketing">Marketing</button>
+          <button class="btn-ghost" data-dept="Financeiro">Financeiro</button>
+          <button class="btn-ghost" data-dept="RH">RH</button>
+          <button class="btn-ghost" data-dept="Jurídico">Jurídico</button>
+          <button class="btn-ghost" data-dept="Comercial">Comercial</button>
+          <button class="btn-ghost" data-dept="Operações">Operações</button>
+          <button class="btn-ghost" data-dept="TI / Infra">TI / Infra</button>
+          <button class="btn-ghost" data-dept="Produto">Produto</button>
+          <button class="btn-ghost" data-dept="Suporte">Suporte</button>
+        </div>
+
+        <div style="margin-top:14px; padding-top:12px; border-top:1px solid rgba(13,231,255,.15);">
+          <div class="row">
+            <button class="btn" id="btnWorkspaceD" type="button">Abrir Workspace</button>
+            <div class="mini" id="wsInfo">Carregando status do Workspace…</div>
+          </div>
+        </div>
+
+        <div id="deptEng" class="hidden">
+          <div class="dept-note"><b>Engenharia / Desenvolvimento</b> — escolha a área:</div>
+          <div class="dept-grid">
+            <button class="btn-ghost" data-dept="Engenharia • iOS">iOS</button>
+            <button class="btn-ghost" data-dept="Engenharia • Android">Android</button>
+            <button class="btn-ghost" data-dept="Engenharia • Backend">Backend</button>
+            <button class="btn-ghost" data-dept="Engenharia • Web">Web</button>
+            <button class="btn-ghost" data-dept="Engenharia • DevOps">DevOps</button>
+            <button class="btn-ghost" data-dept="Engenharia • QA">QA</button>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="btn-ghost" id="btnDeptBack">Voltar</button>
+          </div>
+        </div>
+
+        <div class="msg hidden" id="msgOkD"></div>
+        <div class="msg hidden" id="msgErrD"></div>
+      </div>
+
       <!-- APP -->
       <div class="grid hidden" id="appBox">
         <div class="topbar">
           <div>
-            <div class="title" style="margin:0">Worklog do dia</div>
+            <div class="title" style="margin:0">
+              Worklog do dia
+              <span class="dept-chip" id="deptChip" style="display:none"></span>
+            </div>
             <div class="mini" id="miniInfo"></div>
           </div>
-          <button class="btn-ghost" id="btnLogout">Logout</button>
+          <div class="row" style="justify-content:flex-end">
+            <button class="btn-ghost" id="btnWorkspaceA" type="button">Abrir Workspace</button>
+            <button class="btn-ghost" id="btnChangeDept">Trocar depto</button>
+            <button class="btn-ghost" id="btnLogout">Logout</button>
+          </div>
         </div>
 
         <div class="row">
@@ -305,31 +380,48 @@ def worklog_page(req: Request):
 <script>
   const $ = (id)=>document.getElementById(id);
 
+  // PASSO 1 (LOCAL): link do VS Code no Windows (fallback)
+  // (Passo 2 depois: backend retorna workspace_url remoto e a UI usa automaticamente)
+
+  const DEPT_KEY = "worklog_dept"; // sessionStorage (não fica “pra sempre”)
+  function getDept(){ return (sessionStorage.getItem(DEPT_KEY) || "").trim(); }
+  function setDept(v){ sessionStorage.setItem(DEPT_KEY, (v||"").trim()); }
+  function clearDept(){ sessionStorage.removeItem(DEPT_KEY); }
+
+  function isVisible(id){
+    const el = $(id);
+    return !!(el && !el.classList.contains("hidden"));
+  }
+
   function showOk(id, txt){
     const ok = $(id);
+    if(!ok) return;
     ok.textContent = txt || "";
     ok.classList.remove("hidden","err");
     ok.classList.add("ok");
-    const errId = (id === "msgOk") ? "msgErr" : "msgErr2";
-    $(errId).classList.add("hidden");
+    const errId = (id === "msgOk") ? "msgErr" : (id==="msgOkD" ? "msgErrD" : "msgErr2");
+    const err = $(errId);
+    if(err) err.classList.add("hidden");
   }
   function showErr(id, txt){
     const err = $(id);
+    if(!err) return;
     err.textContent = txt || "";
     err.classList.remove("hidden","ok");
     err.classList.add("err");
-    const okId = (id === "msgErr") ? "msgOk" : "msgOk2";
-    $(okId).classList.add("hidden");
+    const okId = (id === "msgErr") ? "msgOk" : (id==="msgErrD" ? "msgOkD" : "msgOk2");
+    const ok = $(okId);
+    if(ok) ok.classList.add("hidden");
   }
   function clearMsgs(){
-    $("msgOk").classList.add("hidden");
-    $("msgErr").classList.add("hidden");
-    $("msgOk2").classList.add("hidden");
-    $("msgErr2").classList.add("hidden");
+    ["msgOk","msgErr","msgOk2","msgErr2","msgOkD","msgErrD"].forEach(id=>{
+      const el = $(id);
+      if(el) el.classList.add("hidden");
+    });
   }
 
   async function api(path, method, body){
-    const opt = { method: method || "GET", headers: {} };
+    const opt = { method: method || "GET", headers: {}, credentials: "same-origin" };
     if(body !== undefined){
       opt.headers["Content-Type"] = "application/json";
       opt.body = JSON.stringify(body);
@@ -349,13 +441,20 @@ def worklog_page(req: Request):
 
   function showLogin(){
     $("loginBox").classList.remove("hidden");
+    $("deptBox").classList.add("hidden");
     $("appBox").classList.add("hidden");
-    $("btnLogoutFab").classList.add("hidden");
+  }
+  function showDept(){
+    $("loginBox").classList.add("hidden");
+    $("deptBox").classList.remove("hidden");
+    $("appBox").classList.add("hidden");
+    // sempre que entrar na tela de depto, atualiza status
+    refreshWorkspaceStatus();
   }
   function showApp(){
     $("loginBox").classList.add("hidden");
+    $("deptBox").classList.add("hidden");
     $("appBox").classList.remove("hidden");
-    $("btnLogoutFab").classList.remove("hidden");
   }
 
   function fmtTs(ts){
@@ -400,19 +499,28 @@ def worklog_page(req: Request):
     return r;
   }
 
+  function applyDeptChip(){
+    const d = getDept();
+    const chip = $("deptChip");
+    if(d){
+      chip.style.display = "inline-block";
+      chip.textContent = d;
+    } else {
+      chip.style.display = "none";
+      chip.textContent = "";
+    }
+  }
+
   async function enterApp(){
     const r = await loadOrStartToday();
     showApp();
+    applyDeptChip();
+
     const s = r.session;
     $("miniInfo").textContent = s
       ? `Início: ${fmtTs(s.started_at)}${s.ended_at ? " • Encerrado: " + fmtTs(s.ended_at) : ""}`
       : "";
     renderEntries(r.entries || []);
-  }
-
-  async function doLogoutAndBack(){
-    try{ await api("/api/auth/logout","POST",{}); }catch(e){}
-    window.location.href = "/worklog";
   }
 
   // eye toggle
@@ -434,13 +542,14 @@ def worklog_page(req: Request):
       if(!email || !password) return showErr("msgErr","Informe e-mail e senha.");
 
       await api("/api/auth/login","POST",{email, password, source:"Web"});
-      await enterApp();
+      clearDept();             // sempre escolher depto ao logar
+      showDept();              // <- agora vai para departamentos (e puxa status do workspace)
     }catch(e){
       showErr("msgErr","Falha no login: " + (e.message || e));
     }
   });
 
-  // FORGOT
+  // FORGOT: chama API (NÃO abre Outlook)
   $("linkForgot").addEventListener("click", async (ev)=>{
     ev.preventDefault();
     ev.stopPropagation();
@@ -462,14 +571,52 @@ def worklog_page(req: Request):
     }
   });
 
+  // DEPT UI
+  $("btnDeptEng").addEventListener("click", ()=>{
+    $("deptMain").classList.add("hidden");
+    $("deptEng").classList.remove("hidden");
+  });
+  $("btnDeptBack").addEventListener("click", ()=>{
+    $("deptEng").classList.add("hidden");
+    $("deptMain").classList.remove("hidden");
+  });
+
+  // clique em qualquer botão com data-dept
+  document.addEventListener("click", async (ev)=>{
+    const el = ev.target;
+    if(!el) return;
+    const dept = el.getAttribute && el.getAttribute("data-dept");
+    if(!dept) return;
+
+    try{
+      clearMsgs();
+      setDept(dept);
+      showOk("msgOkD", "Departamento selecionado: " + dept);
+      await enterApp();
+    }catch(e){
+      showErr("msgErrD", "Falha ao entrar: " + (e.message || e));
+      showDept();
+    }
+  });
+
   // ADD ENTRY
   $("btnAdd").addEventListener("click", async ()=>{
     try{
       clearMsgs();
       const entry_type = ($("entryType").value || "TASK").toUpperCase();
-      const title = $("title").value.trim();
+      let title = $("title").value.trim();
       const content = $("content").value.trim();
       if(!content) return showErr("msgErr2","Conteúdo obrigatório.");
+
+      const dept = getDept();
+      if(dept){
+        const prefix = "[" + dept + "] ";
+        if(title){
+          if(!title.startsWith(prefix)) title = prefix + title;
+        } else {
+          title = "[" + dept + "]";
+        }
+      }
 
       await api("/api/worklog/entry","POST",{entry_type, title: title || null, content});
       $("content").value = "";
@@ -498,44 +645,114 @@ def worklog_page(req: Request):
     }
   });
 
-  // LOGOUT (botões)
-  $("btnLogout").addEventListener("click", doLogoutAndBack);
-  $("btnLogoutFab").addEventListener("click", doLogoutAndBack);
+  async function doLogout(){
+    try{ await api("/api/auth/logout","POST",{}); }catch(e){}
+    clearDept();
+    location.reload();
+  }
 
-  // WATCHDOG (idle) + derrubar no refresh/fechar aba
-  const IDLE_MIN = 10; // <- ajuste aqui (minutos)
-  let lastAct = Date.now();
+  // WORKSPACE (Passo 3 + Passo 4)
+  async function refreshWorkspaceStatus(){
+    const info = $("wsInfo"); // só existe na tela deptBox
+    if(info) info.textContent = "Carregando status do Workspace…";
 
-  function bump(){ lastAct = Date.now(); }
-  ["mousemove","keydown","click","scroll","touchstart"].forEach(evt=>{
-    document.addEventListener(evt, bump, {passive:true});
-  });
-
-  setInterval(async ()=>{
-    const isInApp = !$("appBox").classList.contains("hidden");
-    if(!isInApp) return;
-    if(Date.now() - lastAct > IDLE_MIN*60*1000){
-      await doLogoutAndBack();
-    }
-  }, 5000);
-
-  window.addEventListener("beforeunload", ()=>{
-    const isInApp = !$("appBox").classList.contains("hidden");
-    if(!isInApp) return;
     try{
-      fetch("/api/auth/logout", {
-        method: "POST",
-        headers: {"Content-Type":"application/json"},
-        body: "{}",
-        keepalive: true
-      });
-    }catch(e){}
+      const r = await api("/api/workspace/status","GET");
+
+      // PASSO 3: mostrar exatamente o texto do backend (r.message)
+      if(info){
+        if(r && typeof r.message === "string" && r.message.trim()){
+          info.textContent = r.message.trim();
+        } else if(r && r.workspace_url){
+          info.textContent = "Workspace disponível. Clique em Abrir Workspace.";
+        } else {
+          info.textContent = "Workspace ainda não configurado.";
+        }
+      }
+
+      // labels
+      const bD = $("btnWorkspaceD");
+      const bA = $("btnWorkspaceA");
+      if(bD) bD.textContent = "Abrir Workspace";
+      if(bA) bA.textContent = "Abrir Workspace";
+
+      return r;
+    }catch(e){
+      // sem enganar o usuário com "pronto" se a API falhar
+      if(info) info.textContent = "Não foi possível ler o status do Workspace (verifique login/servidor).";
+      return null;
+    }
+  }
+
+  async function openWorkspace(){
+    const okId = isVisible("appBox") ? "msgOk2" : "msgOkD";
+    const errId = isVisible("appBox") ? "msgErr2" : "msgErrD";
+
+    clearMsgs();
+    showOk(okId, "Abrindo workspace…");
+
+    // PASSO 4: abre a janela ANTES do await (evita bloqueio de popup)
+    const w = window.open("about:blank", "_blank");
+
+    try{
+      const r = await api("/api/workspace/start","POST",{});
+      let url = (r && r.workspace_url) ? String(r.workspace_url) : "";
+
+      if(!url){
+        if(w) w.close();
+        throw new Error("Workspace sem URL. Verifique WORKLOG_WORKSPACE_ENABLED=1 e WORKLOG_WORKSPACE_PROVIDER=local_vscode.");
+      }
+
+      if(url.startsWith("/")) url = window.location.origin + url;
+
+      if(w) w.location.href = url;
+      else window.location.href = url;
+
+      // fecha a aba em branco depois de disparar o protocolo
+      setTimeout(() => {
+        try { if(w) w.close(); } catch(e) {}
+      }, 800);
+
+      refreshWorkspaceStatus();
+    }catch(e){
+      if(w) w.close();
+      showErr(errId, "Falha ao abrir workspace: " + (e.message || e));
+    }
+  }
+
+  const btnWD = $("btnWorkspaceD");
+  if(btnWD) btnWD.addEventListener("click", openWorkspace);
+
+  const btnWA = $("btnWorkspaceA");
+  if(btnWA) btnWA.addEventListener("click", openWorkspace);
+
+  // LOGOUT
+  $("btnLogout").addEventListener("click", doLogout);
+  $("btnLogout2").addEventListener("click", doLogout);
+
+  // TROCAR DEPTO
+  $("btnChangeDept").addEventListener("click", ()=>{
+    clearMsgs();
+    clearDept();
+    $("deptEng").classList.add("hidden");
+    $("deptMain").classList.remove("hidden");
+    showDept(); // também atualiza status do workspace
   });
 
-  // init: se já estiver logado, entra direto
+  // init: se já estiver logado:
+  // - se depto não escolhido => mostra dept
+  // - se depto escolhido => entra no app
   (async ()=>{
-    try{ await enterApp(); }
-    catch(e){ showLogin(); }
+    try{
+      await api("/api/worklog/today","GET"); // testa se cookie é válido
+      if(!getDept()){
+        showDept();
+      } else {
+        await enterApp();
+      }
+    }catch(e){
+      showLogin();
+    }
   })();
 </script>
 
@@ -564,9 +781,8 @@ def worklog_reset_page(req: Request):
         radial-gradient(900px 420px at 70% 65%, rgba(124,58,237,.18), transparent 60%),
         linear-gradient(180deg, var(--bg0), var(--bg1));
       color: var(--text);
-      display:flex; align-items:flex-start; justify-content:center;
+      display:flex; align-items:center; justify-content:center;
       padding: 18px;
-      overflow-y:auto;
     }
     .wrap{ width:100%; max-width: 720px; }
     .brand{
@@ -662,7 +878,7 @@ def worklog_reset_page(req: Request):
   }
 
   async function api(path, method, body){
-    const opt = { method: method || "GET", headers: {} };
+    const opt = { method: method || "GET", headers: {}, credentials: "same-origin" };
     if(body !== undefined){
       opt.headers["Content-Type"] = "application/json";
       opt.body = JSON.stringify(body);

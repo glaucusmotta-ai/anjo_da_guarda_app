@@ -8,6 +8,8 @@ import secrets
 import smtplib
 import sqlite3
 import ssl
+import subprocess
+
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -158,6 +160,13 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
             "pass_salt": "TEXT",
             "pass_hash": "TEXT",
             "created_at_utc": "TEXT",
+            "git_repo": "TEXT",
+            "git_branch_start": "TEXT",
+            "git_head_start": "TEXT",
+            "git_branch_end": "TEXT",
+            "git_head_end": "TEXT",
+            "git_dirty_end": "INTEGER",
+
         },
     )
 
@@ -701,6 +710,22 @@ def worklog_start(body: StartBody, req: Request):
         con.commit()
 
         sid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+                # baseline git da sessão (para exigir commit no stop)
+        if _git_enabled():
+            try:
+                snap = _git_snapshot()
+                cols_ws = _table_columns(con, "work_sessions")
+                if "git_head_start" in cols_ws:
+                    con.execute(
+                        "UPDATE work_sessions SET git_repo=?, git_branch_start=?, git_head_start=? WHERE id=? AND (git_head_start IS NULL OR git_head_start='')",
+                        (snap["repo"], snap["branch"], snap["head"], int(sid)),
+                    )
+                    con.commit()
+            except Exception as e:
+                # se enforcement ligado e falhar, melhor bloquear cedo
+                raise HTTPException(status_code=500, detail=f"git enforcement falhou no start: {e}")
+
         return {"ok": True, "session_id": int(sid), "started_at": started_at}
     finally:
         con.close()
@@ -856,6 +881,22 @@ def worklog_stop(body: StopBody, req: Request):
 
         if not s:
             raise HTTPException(status_code=400, detail="sessão não iniciada")
+        
+        # ====== GIT ENFORCEMENT (obrigar commit para encerrar) ======
+        if _git_enabled():
+            cols_ws = _table_columns(con, "work_sessions")
+            start_head = s["git_head_start"] if ("git_head_start" in cols_ws) else None
+
+            try:
+                snap = _git_snapshot()
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"git enforcement falhou: {e}")
+
+            if snap["dirty"]:
+                raise HTTPException(status_code=400, detail="Existem alterações NÃO commitadas. Faça commit (ou descarte) para encerrar.")
+
+            if start_head and str(start_head).strip() == snap["head"]:
+                raise HTTPException(status_code=400, detail="Nenhum commit novo desde o início da sessão. Faça commit para encerrar.")
 
         if s["ended"]:
             return {"ok": True}
@@ -891,6 +932,43 @@ def _env_first(*keys: str) -> str:
         if v is not None and str(v).strip() != "":
             return str(v).strip()
     return ""
+
+def _git_enabled() -> bool:
+    v = (os.getenv("WORKLOG_GIT_ENFORCE") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _git_repo_path() -> Path:
+    p = (os.getenv("WORKLOG_REPO_PATH") or "").strip()
+    if p:
+        return Path(p).expanduser().resolve()
+    # fallback: raiz do repo (pela posição do arquivo)
+    return _root_dir()
+
+
+def _git_run(args: list[str]) -> str:
+    repo = _git_repo_path()
+    if not (repo / ".git").exists():
+        raise RuntimeError(f"WORKLOG_REPO_PATH não é repo git: {repo}")
+    cp = subprocess.run(
+        ["git", *args],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    if cp.returncode != 0:
+        err = (cp.stderr or cp.stdout or "").strip()
+        raise RuntimeError(f"git {' '.join(args)} falhou: {err}")
+    return (cp.stdout or "").strip()
+
+
+def _git_snapshot() -> Dict[str, Any]:
+    branch = _git_run(["rev-parse", "--abbrev-ref", "HEAD"])
+    head = _git_run(["rev-parse", "HEAD"])
+    dirty = bool(_git_run(["status", "--porcelain"]))
+    return {"repo": str(_git_repo_path()), "branch": branch, "head": head, "dirty": dirty}
+
 
 
 def _smtp_conf() -> Optional[Dict[str, Any]]:
