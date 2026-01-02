@@ -651,6 +651,31 @@ def worklog_page(req: Request):
     location.reload();
   }
 
+  async function doLogoutGuarded(){
+    const okId  = isVisible("appBox") ? "msgOk2" : "msgOkD";
+    const errId = isVisible("appBox") ? "msgErr2" : "msgErrD";
+
+    clearMsgs();
+
+    // tenta encerrar o dia antes de sair (isso dispara o enforcement do Git)
+    try{
+      const r = await api("/api/worklog/today","GET");
+      if(r && r.session && !r.session.ended_at){
+        showOk(okId, "Antes de sair, encerrando o dia (checando Git)...");
+        const day_summary = ($("daySummary") && $("daySummary").value.trim()) ? $("daySummary").value.trim() : null;
+        await api("/api/worklog/stop","POST",{ source:"Web", day_summary });
+        showOk(okId, "Dia encerrado. Saindo...");
+      }
+    }catch(e){
+      showErr(errId, (e && e.message) ? e.message : String(e));
+      return; // BLOQUEIA o logout
+    }
+
+    await doLogout(); // sai de verdade
+  }
+
+
+
   // WORKSPACE (Passo 3 + Passo 4)
   async function refreshWorkspaceStatus(){
     const info = $("wsInfo"); // só existe na tela deptBox
@@ -727,8 +752,8 @@ def worklog_page(req: Request):
   if(btnWA) btnWA.addEventListener("click", openWorkspace);
 
   // LOGOUT
-  $("btnLogout").addEventListener("click", doLogout);
-  $("btnLogout2").addEventListener("click", doLogout);
+  $("btnLogout").addEventListener("click", doLogoutGuarded);
+  $("btnLogout2").addEventListener("click", doLogoutGuarded);
 
   // TROCAR DEPTO
   $("btnChangeDept").addEventListener("click", ()=>{

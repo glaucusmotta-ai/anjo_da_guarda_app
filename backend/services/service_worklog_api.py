@@ -16,14 +16,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, EmailStr
 
 router = APIRouter(prefix="/api", tags=["worklog-api"])
 
 COOKIE_NAME = "adg_session"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 dias
-
 RESET_TTL_SECONDS = 60 * 30  # 30 min
 
 
@@ -151,6 +150,7 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
         """
     )
     con.commit()
+
     _ensure_columns(
         con,
         "usuarios",
@@ -160,13 +160,6 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
             "pass_salt": "TEXT",
             "pass_hash": "TEXT",
             "created_at_utc": "TEXT",
-            "git_repo": "TEXT",
-            "git_branch_start": "TEXT",
-            "git_head_start": "TEXT",
-            "git_branch_end": "TEXT",
-            "git_head_end": "TEXT",
-            "git_dirty_end": "INTEGER",
-
         },
     )
 
@@ -189,6 +182,7 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
         """
     )
     con.commit()
+
     _ensure_columns(
         con,
         "auth_sessions",
@@ -222,6 +216,8 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
         """
     )
     con.commit()
+
+    # ✅ Git snapshot deve ser em work_sessions (sessão do dia)
     _ensure_columns(
         con,
         "work_sessions",
@@ -235,6 +231,12 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
             "start_source": "TEXT",
             "end_source": "TEXT",
             "day_summary": "TEXT",
+            "git_repo": "TEXT",
+            "git_branch_start": "TEXT",
+            "git_head_start": "TEXT",
+            "git_branch_end": "TEXT",
+            "git_head_end": "TEXT",
+            "git_dirty_end": "INTEGER",
         },
     )
 
@@ -268,8 +270,8 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
 
     # índice por dia (se existir)
     try:
-        cols_ws = _table_columns(con, "work_sessions")
-        day_col = "day_utc" if "day_utc" in cols_ws else ("day" if "day" in cols_ws else None)
+        cols_ws2 = _table_columns(con, "work_sessions")
+        day_col = "day_utc" if "day_utc" in cols_ws2 else ("day" if "day" in cols_ws2 else None)
         if day_col:
             con.execute(
                 f"CREATE UNIQUE INDEX IF NOT EXISTS ux_work_sessions_user_day ON work_sessions(user_id, {day_col});"
@@ -295,6 +297,7 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
         """
     )
     con.commit()
+
     _ensure_columns(
         con,
         "work_entries",
@@ -363,6 +366,97 @@ def _clear_cookie(resp: Response, secure: bool) -> None:
 def _truthy(v: str) -> bool:
     s = (v or "").strip().lower()
     return s in ("1", "true", "yes", "y", "on")
+
+
+# =========================
+# Git helpers (enforcement)
+# =========================
+def _git_enabled() -> bool:
+    # default OFF (só liga quando setar env)
+    return _truthy(os.getenv("WORKLOG_GIT_ENFORCE", "0"))
+
+
+def _git_repo_path() -> Path:
+    p = (os.getenv("WORKLOG_REPO_PATH") or "").strip()
+    if p:
+        return Path(p).expanduser().resolve()
+    return _root_dir()
+
+
+def _git_run(args: list[str]) -> str:
+    repo = _git_repo_path()
+    if not (repo / ".git").exists():
+        raise RuntimeError(f"WORKLOG_REPO_PATH não é repo git: {repo}")
+    cp = subprocess.run(
+        ["git", *args],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    if cp.returncode != 0:
+        err = (cp.stderr or cp.stdout or "").strip()
+        raise RuntimeError(f"git {' '.join(args)} falhou: {err}")
+    return (cp.stdout or "").strip()
+
+
+def _git_dirty_details() -> tuple[bool, str]:
+    """
+    dirty=True se houver mudanças não commitadas.
+    details = saída do git status --porcelain (ou erro).
+    """
+    repo = _git_repo_path()
+    try:
+        cp = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if cp.returncode != 0:
+            err = (cp.stderr or cp.stdout or "").strip()
+            return True, (err or "git status falhou")
+        out = (cp.stdout or "").strip()
+        return (len(out) > 0), out
+    except Exception as e:
+        return True, str(e)
+
+
+def _git_snapshot() -> Dict[str, Any]:
+    branch = _git_run(["rev-parse", "--abbrev-ref", "HEAD"])
+    head = _git_run(["rev-parse", "HEAD"])
+    dirty, details = _git_dirty_details()
+    return {"repo": str(_git_repo_path()), "branch": branch, "head": head, "dirty": dirty, "details": details}
+
+
+def _ws_set_git_start_if_needed(con: sqlite3.Connection, session_id: int) -> None:
+    """
+    Salva git_*_start na work_sessions se ainda não estiver preenchido.
+    Só roda se _git_enabled() estiver ON.
+    """
+    if not _git_enabled():
+        return
+
+    cols = _table_columns(con, "work_sessions")
+    needed = {"git_repo", "git_branch_start", "git_head_start"}
+    if not needed.issubset(cols):
+        return
+
+    snap = _git_snapshot()
+
+    con.execute(
+        """
+        UPDATE work_sessions
+           SET git_repo=?,
+               git_branch_start=?,
+               git_head_start=?
+         WHERE id=?
+           AND (git_head_start IS NULL OR git_head_start='')
+        """,
+        (snap["repo"], snap["branch"], snap["head"], int(session_id)),
+    )
+    con.commit()
 
 
 # =========================
@@ -668,17 +762,22 @@ def worklog_start(body: StartBody, req: Request):
             raise HTTPException(status_code=500, detail="schema work_sessions inválido")
 
         row = con.execute(
-            f"SELECT id, {started_col} as started, {ended_col} as ended FROM work_sessions WHERE user_id=? AND {day_col}=?",
+            f"SELECT id, {started_col} as started, {ended_col} as ended "
+            f"FROM work_sessions WHERE user_id=? AND {day_col}=?",
             (user_id, day),
         ).fetchone()
 
+        # já existe e está aberta
         if row and not row["ended"]:
+            # garante baseline git (se ainda não tem)
+            _ws_set_git_start_if_needed(con, int(row["id"]))
             return {"ok": True, "session_id": int(row["id"]), "started_at": row["started"]}
 
         started_at = _now_utc_iso()
 
+        # existe mas estava encerrada -> reabre
         if row and row["ended"]:
-            sets = []
+            sets: list[str] = []
             if ended_col:
                 sets.append(f"{ended_col}=NULL")
             if m["end_source"]:
@@ -687,8 +786,11 @@ def worklog_start(body: StartBody, req: Request):
                 sets.append(f"{m['day_summary']}=NULL")
             con.execute(f"UPDATE work_sessions SET {', '.join(sets)} WHERE id=?", (int(row["id"]),))
             con.commit()
+
+            _ws_set_git_start_if_needed(con, int(row["id"]))
             return {"ok": True, "session_id": int(row["id"]), "started_at": row["started"]}
 
+        # nova sessão do dia
         cols_ws = _table_columns(con, "work_sessions")
 
         insert_cols = ["user_id"]
@@ -709,24 +811,12 @@ def worklog_start(body: StartBody, req: Request):
         con.execute(f"INSERT INTO work_sessions ({', '.join(insert_cols)}) VALUES ({qmarks})", params2)
         con.commit()
 
-        sid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        sid = int(con.execute("SELECT last_insert_rowid()").fetchone()[0])
 
-                # baseline git da sessão (para exigir commit no stop)
-        if _git_enabled():
-            try:
-                snap = _git_snapshot()
-                cols_ws = _table_columns(con, "work_sessions")
-                if "git_head_start" in cols_ws:
-                    con.execute(
-                        "UPDATE work_sessions SET git_repo=?, git_branch_start=?, git_head_start=? WHERE id=? AND (git_head_start IS NULL OR git_head_start='')",
-                        (snap["repo"], snap["branch"], snap["head"], int(sid)),
-                    )
-                    con.commit()
-            except Exception as e:
-                # se enforcement ligado e falhar, melhor bloquear cedo
-                raise HTTPException(status_code=500, detail=f"git enforcement falhou no start: {e}")
+        # baseline git da sessão (para exigir commit no stop)
+        _ws_set_git_start_if_needed(con, sid)
 
-        return {"ok": True, "session_id": int(sid), "started_at": started_at}
+        return {"ok": True, "session_id": sid, "started_at": started_at}
     finally:
         con.close()
 
@@ -741,11 +831,11 @@ def worklog_today(req: Request):
         _ensure_schema(con)
         day = _utc_day_str()
 
-        m = _ws_cols(con)
         s = _ws_find_today(con, user_id, day)
-
         if not s:
             return {"ok": True, "session": None, "entries": []}
+
+        m = _ws_cols(con)
 
         we = _we_cols(con)
         sid_cols = we["sid_cols"]
@@ -874,18 +964,28 @@ def worklog_stop(body: StopBody, req: Request):
         if not day_col or not ended_col:
             raise HTTPException(status_code=500, detail="schema work_sessions inválido")
 
+        cols_ws = _table_columns(con, "work_sessions")
+
+        select_cols = ["id", f"{ended_col} as ended"]
+        if "git_head_start" in cols_ws:
+            select_cols.append("git_head_start")
+        if "git_branch_start" in cols_ws:
+            select_cols.append("git_branch_start")
+
         s = con.execute(
-            f"SELECT id, {ended_col} as ended FROM work_sessions WHERE user_id=? AND {day_col}=?",
+            f"SELECT {', '.join(select_cols)} FROM work_sessions WHERE user_id=? AND {day_col}=?",
             (user_id, day),
         ).fetchone()
 
         if not s:
             raise HTTPException(status_code=400, detail="sessão não iniciada")
-        
+
+        if s["ended"]:
+            return {"ok": True}
+
         # ====== GIT ENFORCEMENT (obrigar commit para encerrar) ======
         if _git_enabled():
-            cols_ws = _table_columns(con, "work_sessions")
-            start_head = s["git_head_start"] if ("git_head_start" in cols_ws) else None
+            start_head = str(s["git_head_start"]).strip() if ("git_head_start" in s.keys() and s["git_head_start"]) else ""
 
             try:
                 snap = _git_snapshot()
@@ -893,14 +993,29 @@ def worklog_stop(body: StopBody, req: Request):
                 raise HTTPException(status_code=500, detail=f"git enforcement falhou: {e}")
 
             if snap["dirty"]:
-                raise HTTPException(status_code=400, detail="Existem alterações NÃO commitadas. Faça commit (ou descarte) para encerrar.")
+                preview = ""
+                if snap.get("details"):
+                    lines = str(snap["details"]).splitlines()
+                    preview = "\n" + "\n".join(lines[:20])
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Encerramento bloqueado: existem alterações pendentes no Git.\n"
+                        "Faça commit (e push, se for sua regra) e tente novamente."
+                        + preview
+                    ),
+                )
 
-            if start_head and str(start_head).strip() == snap["head"]:
-                raise HTTPException(status_code=400, detail="Nenhum commit novo desde o início da sessão. Faça commit para encerrar.")
+            if start_head and start_head == snap["head"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Encerramento bloqueado: nenhum commit novo desde o início da sessão.\n"
+                        "Faça pelo menos 1 commit e tente novamente."
+                    ),
+                )
 
-        if s["ended"]:
-            return {"ok": True}
-
+        # grava encerramento + (opcional) snapshot git final
         sets = [f"{ended_col}=?"]
         params: list[Any] = [_now_utc_iso()]
 
@@ -910,6 +1025,18 @@ def worklog_stop(body: StopBody, req: Request):
         if m["day_summary"]:
             sets.append(f"{m['day_summary']}=?")
             params.append(body.day_summary)
+
+        if _git_enabled():
+            try:
+                snap2 = _git_snapshot()
+                if "git_branch_end" in cols_ws:
+                    sets.append("git_branch_end=?"); params.append(snap2["branch"])
+                if "git_head_end" in cols_ws:
+                    sets.append("git_head_end=?"); params.append(snap2["head"])
+                if "git_dirty_end" in cols_ws:
+                    sets.append("git_dirty_end=?"); params.append(1 if snap2["dirty"] else 0)
+            except Exception:
+                pass
 
         params.append(int(s["id"]))
         con.execute(f"UPDATE work_sessions SET {', '.join(sets)} WHERE id=?", params)
@@ -933,43 +1060,6 @@ def _env_first(*keys: str) -> str:
             return str(v).strip()
     return ""
 
-def _git_enabled() -> bool:
-    v = (os.getenv("WORKLOG_GIT_ENFORCE") or "1").strip().lower()
-    return v not in ("0", "false", "no", "off")
-
-
-def _git_repo_path() -> Path:
-    p = (os.getenv("WORKLOG_REPO_PATH") or "").strip()
-    if p:
-        return Path(p).expanduser().resolve()
-    # fallback: raiz do repo (pela posição do arquivo)
-    return _root_dir()
-
-
-def _git_run(args: list[str]) -> str:
-    repo = _git_repo_path()
-    if not (repo / ".git").exists():
-        raise RuntimeError(f"WORKLOG_REPO_PATH não é repo git: {repo}")
-    cp = subprocess.run(
-        ["git", *args],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-        timeout=8,
-    )
-    if cp.returncode != 0:
-        err = (cp.stderr or cp.stdout or "").strip()
-        raise RuntimeError(f"git {' '.join(args)} falhou: {err}")
-    return (cp.stdout or "").strip()
-
-
-def _git_snapshot() -> Dict[str, Any]:
-    branch = _git_run(["rev-parse", "--abbrev-ref", "HEAD"])
-    head = _git_run(["rev-parse", "HEAD"])
-    dirty = bool(_git_run(["status", "--porcelain"]))
-    return {"repo": str(_git_repo_path()), "branch": branch, "head": head, "dirty": dirty}
-
-
 
 def _smtp_conf() -> Optional[Dict[str, Any]]:
     """
@@ -980,7 +1070,6 @@ def _smtp_conf() -> Optional[Dict[str, Any]]:
       3) EMAIL_*          (legacy)
       4) SMTP_*           (legacy)
     """
-    # Se quiser desligar envio por env:
     if not _truthy(os.getenv("EMAIL_ENABLED", "true")):
         return None
 
@@ -990,7 +1079,7 @@ def _smtp_conf() -> Optional[Dict[str, Any]]:
     pwd = _env_first("WORKLOG_SMTP_PASS", "COMM_SMTP_PASS", "EMAIL_PASSWORD", "SMTP_PASS")
     from_email = _env_first("WORKLOG_SMTP_FROM", "COMM_SMTP_FROM", "EMAIL_FROM", "SMTP_FROM", "SMTP_USER")
     from_name = _env_first("WORKLOG_SMTP_FROM_NAME", "COMM_SMTP_FROM_NAME", "EMAIL_FROM_NAME", "SMTP_FROM_NAME") or "Anjo Worklog"
-    reply_to = _env_first("WORKLOG_SMTP_REPLY_TO", "COMM_SMTP_REPLY_TO", "EMAIL_REPLY_TO")  # opcional
+    reply_to = _env_first("WORKLOG_SMTP_REPLY_TO", "COMM_SMTP_REPLY_TO", "EMAIL_REPLY_TO")
 
     try:
         port = int(port_s)
@@ -1067,8 +1156,8 @@ def _public_base(req: Request) -> str:
 
 
 def _build_reset_link(req: Request, token: str) -> str:
-    # Página HTML de reset (GET) fica em /api/auth/reset
-    return f"{_public_base(req)}/api/auth/reset?token={token}"
+    # ✅ Página HTML está em /worklog/reset (UI)
+    return f"{_public_base(req)}/worklog/reset?token={token}"
 
 
 def _pr_cols(con: sqlite3.Connection) -> Dict[str, Any]:
@@ -1150,102 +1239,11 @@ def auth_forgot(body: ForgotBody, req: Request):
 
 @router.get("/auth/reset")
 def auth_reset_page(token: str = ""):
+    # compat: links antigos (/api/auth/reset?token=...)
     token = (token or "").strip()
     if not token:
         return HTMLResponse("<h3>Token ausente.</h3>", status_code=400, headers={"Content-Type": "text/html; charset=utf-8"})
-
-    html = f"""<!doctype html>
-<html lang="pt-BR">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Redefinir senha • Worklog</title>
-  <style>
-    :root{{--bg0:#05060a;--bg1:#070b12;--card:#0b1320cc;--line:#0de7ff;--text:#e7eefc;--muted:#a9b4c9;--input:#0c1726;}}
-    *{{box-sizing:border-box}} html,body{{height:100%;margin:0}}
-    body{{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:
-      radial-gradient(900px 420px at 30% 25%, rgba(13,231,255,.20), transparent 60%),
-      radial-gradient(900px 420px at 70% 65%, rgba(124,58,237,.18), transparent 60%),
-      linear-gradient(180deg,var(--bg0),var(--bg1));
-      color:var(--text);display:flex;align-items:center;justify-content:center;padding:18px}}
-    .wrap{{width:100%;max-width:560px}}
-    .card{{background:var(--card);border-radius:18px;padding:18px;border:1px solid rgba(13,231,255,.35);
-      box-shadow:0 0 18px rgba(13,231,255,.20),0 0 28px rgba(124,58,237,.14);backdrop-filter:blur(10px)}}
-    h2{{margin:0 0 10px;font-size:18px}}
-    label{{display:block;font-size:12px;color:var(--muted);margin:10px 0 6px}}
-    .pw{{position:relative}}
-    input{{width:100%;background:var(--input);color:var(--text);border:1px solid rgba(13,231,255,.22);
-      border-radius:12px;padding:12px 46px 12px 12px;outline:none}}
-    input:focus{{border-color:rgba(13,231,255,.55);box-shadow:0 0 0 3px rgba(13,231,255,.12)}}
-    .eye{{position:absolute;right:8px;top:50%;transform:translateY(-50%);border:1px solid rgba(13,231,255,.30);
-      background:transparent;color:var(--text);border-radius:10px;width:36px;height:34px;cursor:pointer}}
-    .btn{{margin-top:14px;border:0;border-radius:12px;padding:10px 14px;font-weight:800;cursor:pointer;color:#001018;
-      background:linear-gradient(90deg, rgba(13,231,255,.95), rgba(124,58,237,.75));box-shadow:0 0 16px rgba(13,231,255,.22)}}
-    .ok{{margin-top:10px;color:#9fe7b3;font-size:12px}} .err{{margin-top:10px;color:#ffb4b4;font-size:12px;white-space:pre-wrap}}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <h2>Redefinir senha</h2>
-
-      <label>Nova senha</label>
-      <div class="pw">
-        <input id="p1" type="password" placeholder="Digite a nova senha (mín. 8)" />
-        <button class="eye" id="e1" type="button">👁</button>
-      </div>
-
-      <label>Confirmar senha</label>
-      <div class="pw">
-        <input id="p2" type="password" placeholder="Repita a nova senha" />
-        <button class="eye" id="e2" type="button">👁</button>
-      </div>
-
-      <button class="btn" id="btn">Salvar nova senha</button>
-      <div class="ok" id="ok" style="display:none"></div>
-      <div class="err" id="err" style="display:none"></div>
-    </div>
-  </div>
-
-<script>
-  const TOKEN = {token!r};
-
-  function toggle(btnId, inputId){{
-    const b=document.getElementById(btnId);
-    const i=document.getElementById(inputId);
-    b.addEventListener("click", ()=>{{ i.type = (i.type==="password") ? "text" : "password"; }});
-  }}
-  toggle("e1","p1");
-  toggle("e2","p2");
-
-  function ok(t){{ const o=document.getElementById("ok"); const e=document.getElementById("err");
-    e.style.display="none"; o.textContent=t; o.style.display="block"; }}
-  function err(t){{ const o=document.getElementById("ok"); const e=document.getElementById("err");
-    o.style.display="none"; e.textContent=t; e.style.display="block"; }}
-
-  document.getElementById("btn").addEventListener("click", async ()=>{{
-    const p1=document.getElementById("p1").value;
-    const p2=document.getElementById("p2").value;
-    if(!p1 || p1.length < 8) return err("Senha muito curta (mínimo 8).");
-    if(p1 !== p2) return err("As senhas não conferem.");
-
-    try{{
-      const r = await fetch("/api/auth/reset", {{
-        method:"POST",
-        headers:{{"Content-Type":"application/json"}},
-        body: JSON.stringify({{token: TOKEN, password: p1}})
-      }});
-      const data = await r.json().catch(()=>null);
-      if(!r.ok) throw new Error((data && data.detail) ? JSON.stringify(data.detail) : "erro");
-      ok("Senha atualizada. Você já pode voltar ao /worklog e entrar.");
-    }}catch(ex){{
-      err("Falha ao redefinir: " + (ex.message || ex));
-    }}
-  }});
-</script>
-</body>
-</html>"""
-    return HTMLResponse(content=html, headers={"Content-Type": "text/html; charset=utf-8"})
+    return RedirectResponse(url=f"/worklog/reset?token={token}", status_code=302)
 
 
 @router.post("/auth/reset")
