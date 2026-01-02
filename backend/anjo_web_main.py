@@ -55,6 +55,7 @@ from services.metrics import registrar_sos_event
 from services.service_worklog_ui import router as worklog_ui_router
 from services.service_worklog_api import router as worklog_api_router
 from services.service_worklog_workspace import router as worklog_workspace_router
+from services.service_auth_worklog_api import router as auth_worklog_api_router
 
 
 
@@ -115,11 +116,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 app.include_router(worklog_ui_router)
 app.include_router(worklog_api_router)
 app.include_router(worklog_workspace_router)
-
-
+app.include_router(auth_worklog_api_router)
 
 
 # ---------------------------------------------------------
