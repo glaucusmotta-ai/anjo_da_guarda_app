@@ -325,6 +325,7 @@ class SosDispatcher(private val ctx: Context) {
      * Envia para os canais usando segredos do BuildConfig e destinatários vindos da UI.
      */
     fun sendAll(
+        context: Context,
         text: String,
         lat: Double?, lon: Double?,
         tgTarget: String?,
@@ -367,6 +368,16 @@ class SosDispatcher(private val ctx: Context) {
                     sendTelegram(fullText, tgTarget, lat, lon)
                 } catch (t: Throwable) {
                     Log.e("TG", "falha TG", t)
+                }
+            }
+
+            // SMS via OPERADORA (SMSAddon) — tenta primeiro
+            if (isSmsAddonActive(context)) {
+                try {
+                    sendCarrierSms(smsTo, fullText)
+                    Log.d("CARRIER_SMS", "requested to=${smsTo.size}")
+                } catch (t: Throwable) {
+                    Log.e("CARRIER_SMS", "err carrier, fallback zenvia", t)
                 }
             }
 
@@ -660,3 +671,32 @@ class SosDispatcher(private val ctx: Context) {
         }
     }
 }
+
+    // ---------------- SMS via OPERADORA ----------------
+    private fun isSmsAddonActive(context: Context): Boolean {
+        val p = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+
+        fun getBoolAny(key: String): Boolean {
+            // Flutter costuma gravar com prefixo "flutter."
+            return p.getBoolean("flutter.$key", false) || p.getBoolean(key, false)
+        }
+
+        val enabled  = getBoolAny(SmsAddonKeys.SMS_ADDON_ENABLED)
+        val entitled = getBoolAny(SmsAddonKeys.SMS_ADDON_ENTITLED)
+        return enabled && entitled
+    }
+
+    private fun sendCarrierSms(list: List<String>, msg: String) {
+        val sms = android.telephony.SmsManager.getDefault()
+
+        for (raw in list) {
+            val to = raw.trim()
+            if (to.isBlank()) continue
+
+            val parts = sms.divideMessage(msg)
+            sms.sendMultipartTextMessage(to, null, parts, null, null)
+
+            Log.d("CARRIER_SMS", "sent to=$to parts=${parts.size}")
+        }
+    }
+

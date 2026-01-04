@@ -39,6 +39,7 @@ class MainActivity : FlutterActivity() {
                         Log.d("ANJO_SOS", "lat=" + (lat?.toString() ?: "null") + " lon=" + (lon?.toString() ?: "null"))
 
                         SosDispatcher(this).sendAll(
+                            context = this@MainActivity,
                             text = text,
                             lat = lat, lon = lon,
                             tgTarget = tgTarget,
@@ -115,6 +116,7 @@ class MainActivity : FlutterActivity() {
                         val emailTo  = call.argument<ArrayList<String>>("emailTo") ?: arrayListOf()
 
                         SosDispatcher(this).sendAll(
+                            context = this@MainActivity,
                             text = text,
                             lat = lat, lon = lon,
                             tgTarget = tgTarget,

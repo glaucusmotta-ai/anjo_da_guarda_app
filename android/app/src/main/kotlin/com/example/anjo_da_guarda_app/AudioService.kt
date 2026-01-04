@@ -708,6 +708,7 @@ class AudioService : Service(), RecognitionListener {
         fun fireAll(lat: Double?, lon: Double?) {
             val dispatcher = sosDispatcher ?: SosDispatcher(this).also { sosDispatcher = it }
             dispatcher.sendAll(
+                context = applicationContext,
                 text = baseText,
                 lat = lat,
                 lon = lon,
