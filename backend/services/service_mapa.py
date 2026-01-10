@@ -479,6 +479,8 @@ def central_page() -> HTMLResponse:
         <div id="actions">
           <span class="btn" id="btn-fit">Visão geral</span>
           <span class="btn" id="btn-toggle-sidebar">Ocultar lista</span>
+          <a class="btn" id="btn-localiza" href="/central/localiza">Central Localiza</a>
+          <a class="btn" id="btn-sair" href="/central/logout">Sair</a>
         </div>
       </div>
 
@@ -838,6 +840,7 @@ def render_tracking_public_html(session_id: str) -> str:
       border-radius: 3px;
       border: 1px solid #444;
       background: #222;
+      text-decoration: none;
       color: #fff;
       cursor: pointer;
       user-select: none;

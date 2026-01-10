@@ -54,6 +54,11 @@ class SosDispatcher(private val ctx: Context) {
         return "https://maps.google.com/?q=$lat,$lon"
     }
 
+    private fun anjoTrackPointLink(lat: Double?, lon: Double?): String? {
+        if (lat == null || lon == null) return null
+        return "https://anjo-track.3g-brasil.com/p?lat=$lat&lon=$lon"
+    }
+
     private fun stripForSms(s: String): String {
         // SMS da Zenvia costuma rejeitar alguns caracteres (erro 011). Removemos acentos/emoji.
         var t = Normalizer.normalize(s, Normalizer.Form.NFD)
@@ -151,8 +156,7 @@ class SosDispatcher(private val ctx: Context) {
                 val sessionId = obj.optString("session_id", "").trim()
                 if (sessionId.isNotEmpty()) {
                     try {
-                        val prefs =
-                            ctx.getSharedPreferences("ANJO_LIVE_TRACK", Context.MODE_PRIVATE)
+                        val prefs = ctx.getSharedPreferences("ANJO_LIVE_TRACK", Context.MODE_PRIVATE)
                         prefs.edit().putString("session_id", sessionId).apply()
                         Log.d("LIVE_TRACK", "session_id salvo: $sessionId")
                     } catch (t: Throwable) {
@@ -221,9 +225,7 @@ class SosDispatcher(private val ctx: Context) {
 
     // Método público chamado pelo Flutter (via NativeSos), se quiser:
     fun liveTrackUpdate(lat: Double?, lon: Double?) {
-        thread {
-            updateLiveTrackInternal(lat, lon)
-        }
+        thread { updateLiveTrackInternal(lat, lon) }
     }
 
     // ---------- Permissão de localização (para o loop interno) ----------
@@ -285,10 +287,7 @@ class SosDispatcher(private val ctx: Context) {
 
                 val loc = result.lastLocation
                 if (loc != null) {
-                    Log.d(
-                        "LIVE_TRACK",
-                        "loop update lat=${loc.latitude} lon=${loc.longitude}"
-                    )
+                    Log.d("LIVE_TRACK", "loop update lat=${loc.latitude} lon=${loc.longitude}")
                     thread {
                         try {
                             updateLiveTrackInternal(loc.latitude, loc.longitude)
@@ -335,7 +334,6 @@ class SosDispatcher(private val ctx: Context) {
     ) {
         // Tudo em segundo plano para não violar StrictMode (NetworkOnMainThread)
         thread {
-            // texto base (sem link)
             val baseText = text
 
             // 1) Tenta iniciar live tracking e pegar o tracking_url
@@ -359,7 +357,7 @@ class SosDispatcher(private val ctx: Context) {
             Log.d(
                 "ANJO_SOS",
                 "dispatch -> smsTo=${smsTo.size} waTo=${waTo.size} emailTo=${emailTo.size} " +
-                        "lat=$lat lon=$lon trackingLink=$trackingLink"
+                    "lat=$lat lon=$lon trackingLink=$trackingLink"
             )
 
             // TELEGRAM
@@ -371,22 +369,37 @@ class SosDispatcher(private val ctx: Context) {
                 }
             }
 
-            // SMS via OPERADORA (SMSAddon) — tenta primeiro
-            if (isSmsAddonActive(context)) {
+            // ✅ SMS via OPERADORA (SMSAddon) — tenta primeiro
+            var carrierSent = false
+            val smsAddonActive = isSmsAddonActive(context)
+
+            if (smsAddonActive) {
                 try {
-                    sendCarrierSms(smsTo, fullText)
-                    Log.d("CARRIER_SMS", "requested to=${smsTo.size}")
+                    val carrierLink = trackingLink ?: anjoTrackPointLink(lat, lon) ?: mapsLink(lat, lon)
+                    val carrierText = if (carrierLink != null) {
+                        "$baseText\nLocalização (mapa): $carrierLink"
+                    } else {
+                        baseText
+                    }
+
+                    sendCarrierSms(smsTo, carrierText)
+                    carrierSent = true
+                    Log.d("CARRIER_SMS", "requested to=${smsTo.size} link=$carrierLink")
                 } catch (t: Throwable) {
                     Log.e("CARRIER_SMS", "err carrier, fallback zenvia", t)
                 }
+            } else {
+                Log.d("CARRIER_SMS", "skip (smsAddonActive=false)")
             }
 
-            // SMS (Zenvia)
-            thread {
-                try {
-                    sendZenviaSms(fullText, smsTo)
-                } catch (t: Throwable) {
-                    Log.e("ZENVIA_SMS", "falha SMS", t)
+            // SMS (Zenvia) — só se carrier não enviou
+            if (!carrierSent) {
+                thread {
+                    try {
+                        sendZenviaSms(fullText, smsTo)
+                    } catch (t: Throwable) {
+                        Log.e("ZENVIA_SMS", "falha SMS", t)
+                    }
                 }
             }
 
@@ -402,7 +415,6 @@ class SosDispatcher(private val ctx: Context) {
             // E-MAIL – via backend FastAPI (/api/email-sos)
             thread {
                 try {
-                    // Para e-mail, mandamos o texto base + trackingLink separado
                     val finalTracking = trackingLink ?: link
                     sendEmailViaBackend(baseText, emailTo, finalTracking)
                 } catch (t: Throwable) {
@@ -670,27 +682,50 @@ class SosDispatcher(private val ctx: Context) {
             Log.e("MAIL_BACKEND", "erro ao enviar e-mail via backend", t)
         }
     }
-}
 
     // ---------------- SMS via OPERADORA ----------------
     private fun isSmsAddonActive(context: Context): Boolean {
         val p = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
 
-        fun getBoolAny(key: String): Boolean {
-            // Flutter costuma gravar com prefixo "flutter."
-            return p.getBoolean("flutter.$key", false) || p.getBoolean(key, false)
+        fun bool(key: String): Boolean = try {
+            p.getBoolean(key, false)
+        } catch (_: Throwable) {
+            false
         }
 
-        val enabled  = getBoolAny(SmsAddonKeys.SMS_ADDON_ENABLED)
-        val entitled = getBoolAny(SmsAddonKeys.SMS_ADDON_ENTITLED)
+        // Observação: você mostrou no terminal que as chaves estão exatamente assim:
+        // flutter.smsAddonEntitled / flutter.smsAddonEnabled
+        val enabledDirect =
+            bool("flutter.smsAddonEnabled") || bool("smsAddonEnabled")
+
+        val entitledDirect =
+            bool("flutter.smsAddonEntitled") || bool("smsAddonEntitled")
+
+        // Fallback: caso seu projeto use constantes (mantém compatibilidade)
+        val enabledByConst =
+            bool("flutter.${SmsAddonKeys.SMS_ADDON_ENABLED}") || bool(SmsAddonKeys.SMS_ADDON_ENABLED)
+
+        val entitledByConst =
+            bool("flutter.${SmsAddonKeys.SMS_ADDON_ENTITLED}") || bool(SmsAddonKeys.SMS_ADDON_ENTITLED)
+
+        val enabled = enabledDirect || enabledByConst
+        val entitled = entitledDirect || entitledByConst
+
+        Log.d(
+            "CARRIER_SMS",
+            "addon flags -> enabled=$enabled entitled=$entitled " +
+                "(direct: e=$enabledDirect t=$entitledDirect | const: e=$enabledByConst t=$entitledByConst)"
+        )
+
         return enabled && entitled
     }
 
+    @Suppress("DEPRECATION")
     private fun sendCarrierSms(list: List<String>, msg: String) {
         val sms = android.telephony.SmsManager.getDefault()
 
         for (raw in list) {
-            val to = raw.trim()
+            val to = normalizeMsisdn(raw.trim())
             if (to.isBlank()) continue
 
             val parts = sms.divideMessage(msg)
@@ -699,4 +734,4 @@ class SosDispatcher(private val ctx: Context) {
             Log.d("CARRIER_SMS", "sent to=$to parts=${parts.size}")
         }
     }
-
+}

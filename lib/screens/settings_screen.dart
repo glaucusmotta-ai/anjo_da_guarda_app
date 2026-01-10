@@ -1163,11 +1163,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               }
 
                               if (kDebugMode) {
-                                setState(() => _smsAddonEnabled = true);
+                                setState(() {
+                                  _smsAddonEnabled = true;
+                                  _smsAddonEntitled = true; // DEV: permite testar offline
+                                });
                                 await _persistSmsAddonFlags();
                                 return;
                               }
-
+                              
                               if (_smsAddonEntitled) {
                                 setState(() => _smsAddonEnabled = true);
                                 await _persistSmsAddonFlags();
