@@ -56,6 +56,25 @@ from services.service_worklog_ui import router as worklog_ui_router
 from services.service_worklog_api import router as worklog_api_router
 from services.service_worklog_workspace import router as worklog_workspace_router
 from services.service_auth_worklog_api import router as auth_worklog_api_router
+from services.service_central_localiza import (
+    central_localiza_page,
+    central_localiza_login,
+    central_localiza_logout,
+    central_localiza_forgot,
+    central_localiza_exit,
+)
+
+from services.service_auth_central import (
+    central_validate_credentials,
+    create_central_session,
+    set_central_session_cookie,
+    clear_central_session_cookie,
+    revoke_central_session,
+    CENTRAL_COOKIE_NAME,
+    central_user_from_request,   # <-- ADICIONA ESTA LINHA
+)
+
+
 
 
 
@@ -121,6 +140,16 @@ app.include_router(worklog_ui_router)
 app.include_router(worklog_api_router)
 app.include_router(worklog_workspace_router)
 app.include_router(auth_worklog_api_router)
+
+# Localiza (rota original)
+app.add_api_route("/central/localiza", central_localiza_page, methods=["GET"], response_class=HTMLResponse)
+app.add_api_route("/central/localiza/login", central_localiza_login, methods=["POST"])
+app.add_api_route("/central/localiza/logout", central_localiza_logout, methods=["GET"])
+app.add_api_route("/central/localiza/forgot", central_localiza_forgot, methods=["GET"], response_class=HTMLResponse)
+app.add_api_route("/central/localiza/exit", central_localiza_exit, methods=["GET"])
+
+
+
 
 
 # ---------------------------------------------------------
@@ -354,6 +383,91 @@ def api_live_track_points(session_id: str):
 
 
 from fastapi.responses import HTMLResponse  # (mantido; duplicado não quebra)
+
+def _central_login_html(error_msg: str = "") -> str:
+    err = f"<div style='color:#ffb3b3;margin:0 0 10px 0;'>{error_msg}</div>" if error_msg else ""
+    return f"""<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Login - Central</title>
+  <style>
+    body {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+           font-family:Arial; background:#000; color:#fff; padding:18px; }}
+    .card {{ width:min(520px, 95vw); background:#111; border:1px solid #333; border-radius:12px; padding:16px; }}
+    h1 {{ margin:0 0 8px 0; font-size:18px; }}
+    label {{ display:block; margin:10px 0 6px; font-size:13px; color:#ddd; }}
+    input {{ width:100%; height:42px; border-radius:10px; border:1px solid #444; background:#000; color:#fff;
+            padding:0 12px; box-sizing:border-box; }}
+    .row {{ position:relative; }}
+    .eye {{ position:absolute; right:10px; top:50%; transform:translateY(-50%); cursor:pointer; opacity:.85; }}
+    button {{ width:100%; height:44px; border-radius:10px; border:1px solid #444; background:#222; color:#fff;
+             margin-top:12px; font-weight:700; cursor:pointer; }}
+    button:hover {{ background:#2b2b2b; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🚨 Central - Login</h1>
+    {err}
+    <form method="post" action="/central/login" autocomplete="off">
+      <label for="u">Usuário</label>
+      <input id="u" name="username" placeholder="seu@email.com" required />
+
+      <label for="p">Senha</label>
+      <div class="row">
+        <input id="p" name="password" type="password" placeholder="••••••••" required />
+        <span class="eye" id="eye">👁️</span>
+      </div>
+
+      <button type="submit">Entrar</button>
+    </form>
+  </div>
+
+  <script>
+    const eye = document.getElementById("eye");
+    const p = document.getElementById("p");
+    eye.onclick = () => p.type = (p.type === "password") ? "text" : "password";
+  </script>
+</body>
+</html>"""
+
+@app.get("/central/login", response_class=HTMLResponse)
+async def central_login_page(request: Request):
+    # se já estiver logado, volta pra central
+    if central_user_from_request(request):
+        return RedirectResponse(url="/central", status_code=303)
+    return HTMLResponse(_central_login_html())
+
+@app.post("/central/login", response_class=HTMLResponse)
+async def central_login_post(request: Request):
+    form = await request.form()
+    username = (form.get("username") or "").strip()
+    password = (form.get("password") or "")
+
+    if not central_validate_credentials(username, password):
+        return HTMLResponse(_central_login_html("Credenciais inválidas."), status_code=401)
+
+    ip = (request.client.host if request.client else "") or ""
+    ua = request.headers.get("user-agent", "") or ""
+    token = create_central_session(username=username, ip=ip, user_agent=ua)
+
+    resp = RedirectResponse(url="/central", status_code=303)
+    set_central_session_cookie(resp, token)
+    return resp
+
+@app.get("/central/logout")
+def central_logout(request: Request):
+    # pega token do cookie e revoga no DB
+    token = request.cookies.get(CENTRAL_COOKIE_NAME) or ""
+    if token:
+        revoke_central_session(token)
+
+    # redireciona e limpa cookie
+    resp = RedirectResponse(url="/central/login", status_code=303)
+    clear_central_session_cookie(resp)
+    return resp
 
 
 # -----------------------------------------------------
@@ -2460,6 +2574,15 @@ def metrics_sos_by_phone(days: int = 30):
         "rows": [dict(r) for r in rows],
     }
 
+
+# -----------------------------------------------------------------
+# GARANTIA: rotas do Localiza no app FINAL exportado
+# -----------------------------------------------------------------
+try:
+    if not any(getattr(r, "path", "").startswith("/central/localiza") for r in app.routes):
+        app.include_router(central_localiza_router)
+except Exception:
+    pass
 
 # ---------------------------------------------------------
 # Estáticos
